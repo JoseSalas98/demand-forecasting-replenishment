@@ -15,6 +15,13 @@ el gasto estimado y su variabilidad de demanda."
 ¿Qué artículos son de alto y lento movimiento, considerando la estacionalidad, y cuánto aporta cada
 uno al gasto estimado? ¿Cuáles necesitan más promoción?
 
+## Clarifications
+
+### Session 2026-10-24
+
+- Q: ¿Con qué frecuencia temporal se agregan las unidades de cada artículo para calcular su CV? → A: Por periodos de 28 días por defecto, como parámetro configurable (`cv_aggregation`) para experimentar con otras agregaciones (diaria, semanal, periodo de segmentación) solo dentro de train.
+- Q: ¿Qué regla individual hace que un artículo se considere "estable" en train? → A: Por defecto, misma clase ABC en las 3 comparaciones (XYZ puede variar y se reporta). La regla se elige con el parámetro `stability_rule`, y las alternativas (ABC y XYZ en las 3; misma celda en ≥2 de 3; clase A en los años 1 a 4) quedan implementadas como reglas intercambiables para experimentar con ellas.
+
 ## User Scenarios & Testing *(mandatory)*
 
 Actor principal: analista de categoría o abastecimiento que decide qué artículos priorizar en
@@ -214,9 +221,12 @@ tratamiento sean idénticos antes y después.
   acumulado y porcentaje acumulado, y asignar A hasta el corte A (por defecto 80 %), B hasta el
   corte B (por defecto 95 %) y C al resto.
 - **FR-012**: El sistema DEBE calcular el CV de cada artículo agregado como desviación estándar /
-  media de sus unidades, en porcentaje, sobre [NEEDS CLARIFICATION: ¿qué serie temporal se usa
-  para el CV: unidades diarias, semanales o por periodo de segmentación? Cambia mucho la
-  proporción de artículos X, Y y Z].
+  media de sus unidades, en porcentaje, sobre la serie de unidades agregadas según el parámetro
+  `cv_aggregation` (por defecto, bloques de 28 días alineados con el horizonte de pronóstico;
+  alternativas: diaria, semanal `wm_yr_wk` o periodo de segmentación). Los bloques incompletos
+  por lanzamiento o por el borde del periodo se excluyen del cálculo. Las alternativas a
+  comparar y el criterio de elección DEBEN declararse antes de experimentar, la elección se hace
+  solo con train y el valor elegido queda congelado con la matriz.
 - **FR-013**: El sistema DEBE asignar X si CV < umbral X (por defecto 10 %), Y si umbral X ≤ CV <
   umbral Z (por defecto 25 %) y Z si CV ≥ umbral Z. Los valores por defecto son de práctica y
   DEBEN verificarse antes de usarse para decidir.
@@ -232,15 +242,25 @@ tratamiento sean idénticos antes y después.
 - **FR-017**: El sistema DEBE calcular la matriz global de train y contrastarla con cada matriz
   anual mediante el porcentaje de artículos con la misma clase y el PSI sobre la proporción de
   clases, con umbrales configurables.
-- **FR-018**: El sistema DEBE marcar como estable en train a un artículo cuando [NEEDS
-  CLARIFICATION: ¿qué regla individual define "estable"? Por ejemplo, misma clase ABC y XYZ en
-  todos los años 2 a 4 frente a su referencia, o misma clase en la mayoría de las comparaciones].
+- **FR-018**: El sistema DEBE marcar como estable en train a un artículo según la regla elegida
+  en el parámetro `stability_rule`. Por defecto (`abc_all`), un artículo es estable si tiene la
+  misma clase ABC en las 3 comparaciones (año 2, 3 y 4 frente a su referencia). La clase XYZ
+  puede variar, y sus cambios se reportan. DEBEN estar disponibles como reglas intercambiables,
+  con la misma entrada (clases por artículo y comparación) y la misma salida (estable sí/no):
+  - `abc_all` (por defecto): misma clase ABC en las 3 comparaciones.
+  - `abc_xyz_all`: misma clase ABC y misma clase XYZ en las 3 comparaciones.
+  - `cell_majority`: misma celda ABC × XYZ en al menos 2 de las 3 comparaciones.
+  - `a_every_year`: clase A en cada uno de los años 1 a 4, sin mirar XYZ.
+  Las reglas a comparar y el criterio de elección DEBEN declararse antes de experimentar. La
+  elección se hace solo con train y la regla elegida queda congelada con la lista objetivo.
+  Justificación de la abstracción (Principio III, condición a): es una regla de negocio que
+  cambia de forma independiente y tiene varias implementaciones reales.
 - **FR-019**: El sistema DEBE construir la lista de productos objetivo con los artículos de clase A
   estables en train y asignar a cada uno un tratamiento según su gasto y su CV, siguiendo
   [NEEDS CLARIFICATION: ¿qué tratamientos existen y qué celda o regla lleva a cada uno? Por
   ejemplo, AX abastecimiento regular, AY abastecimiento con revisión, AZ prioridad de promoción].
 - **FR-020**: El sistema DEBE serializar y congelar la lista objetivo, su tratamiento, el periodo
-  de segmentación elegido, los cortes ABC y los umbrales XYZ. Las etapas siguientes DEBEN
+  de segmentación elegido, los cortes ABC, los umbrales XYZ, la agregación del CV y la regla de estabilidad. Las etapas siguientes DEBEN
   cargarlos sin recalcularlos.
 - **FR-021**: El análisis de estabilidad NO DEBE usar ningún dato del año 5.
 
