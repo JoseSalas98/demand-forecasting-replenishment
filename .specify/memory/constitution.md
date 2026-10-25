@@ -81,6 +81,10 @@ en ABC y en el CV que alterarían la clasificación.
 - Antes de crear una abstracción, DEBE quedar escrito cuál de las condiciones (a), (b) o (c) la
   justifica.
 - La estructura de carpetas del proyecto es fija: `data/` (con `raw/`, `interim/`, `processed/`, `external/`), `notebooks/`, `models/`, `reports/` y `src/`. No crear, mover ni renombrar carpetas de la raíz sin aprobación explícita.
+- El código fuente de producción va en `src/`.
+- Los notebooks de exploración y análisis van en `notebooks/`. No se generan en la raíz ni
+  dentro de `src/`.
+- No se escribe código de análisis en la raíz del proyecto.
 - Las dependencias se gestionan con uv por grupos (`ds`, `deploy`, `back`, `algo`) en `pyproject.toml`. Agregar paquetes con `uv add --group <grupo>`.
 
 **Razón:** parámetros centralizados y con historial hacen auditable cada decisión; la regla de
