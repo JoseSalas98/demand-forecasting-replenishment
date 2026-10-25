@@ -21,6 +21,10 @@ uno al gasto estimado? ¿Cuáles necesitan más promoción?
 
 - Q: ¿Con qué frecuencia temporal se agregan las unidades de cada artículo para calcular su CV? → A: Por periodos de 28 días por defecto, como parámetro configurable (`cv_aggregation`) para experimentar con otras agregaciones (diaria, semanal, periodo de segmentación) solo dentro de train.
 - Q: ¿Qué regla individual hace que un artículo se considere "estable" en train? → A: Por defecto, misma clase ABC en las 3 comparaciones (XYZ puede variar y se reporta). La regla se elige con el parámetro `stability_rule`, y las alternativas (ABC y XYZ en las 3; misma celda en ≥2 de 3; clase A en los años 1 a 4) quedan implementadas como reglas intercambiables para experimentar con ellas.
+- Q: ¿Qué tratamientos existen para los productos objetivo y qué regla asigna cada uno? → A: Mapeo por celda en la configuración (`treatment_map`): AX → abastecimiento regular (guiado por pronóstico), AY → abastecimiento con revisión periódica, AZ → prioridad de promoción / revisión de demanda.
+- Q: ¿Cómo se obtiene la clase de referencia de un artículo frente al promedio de años previos? → A: Se promedia el gasto anual del artículo sobre los años previos activos y se reclasifica ABC sobre ese promedio; para XYZ se promedia su CV anual.
+- Q: ¿Cómo se identifica la fecha de lanzamiento de un artículo? → A: Primera `wm_yr_wk` con precio en el archivo de precios, por tienda; el artículo agregado empieza en el lanzamiento más temprano entre tiendas.
+- Q: ¿El modelo se elige por producto objetivo o por grupo? → A: No se fija en la spec; es el parámetro `selection_level`, cuyas etiquetas define el analista durante la experimentación, declarado antes del backtesting y congelado con el modelo.
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -106,7 +110,7 @@ mismo conjunto y los mismos 13 orígenes.
 **Acceptance Scenarios**:
 
 1. **Given** los candidatos de búsqueda declarados antes de experimentar, **When** se ejecuta el
-   backtesting en train, **Then** se elige un modelo por producto o grupo usando solo train, y el
+   backtesting en train, **Then** se elige un modelo al nivel indicado en `selection_level` usando solo train, y el
    modelo y sus parámetros quedan congelados.
 2. **Given** el modelo congelado, **When** se evalúa en test, **Then** se producen pronósticos en
    13 orígenes consecutivos cada 28 días, sin reentrenar. Solo se actualizan los datos observados
@@ -197,8 +201,11 @@ tratamiento sean idénticos antes y después.
   sean enteros no negativos y los precios ausentes o no positivos.
 - **FR-003**: El sistema DEBE validar que el calendario tenga fechas válidas y continuas, y
   detenerse si no las tiene.
-- **FR-004**: El sistema DEBE identificar la semana de lanzamiento de cada artículo y excluir las
-  semanas previas de entrenamiento, evaluación y cálculos de uso, gasto y CV.
+- **FR-004**: El sistema DEBE identificar la semana de lanzamiento de cada artículo por tienda
+  como la primera `wm_yr_wk` con precio en el archivo de precios, y excluir las semanas previas
+  de esa tienda de entrenamiento, evaluación y cálculos de uso, gasto y CV. El lanzamiento del
+  artículo agregado es el más temprano entre sus tiendas. Las filas de prelanzamiento sin precio
+  no se cuentan como rechazos por precio ausente.
 - **FR-005**: El sistema DEBE partir los datos en un único train (años 1 a 4) y un único test
   (año 5, 13 bloques de 28 días sin solapamiento), con fechas exactas fijadas en la configuración.
 
@@ -238,7 +245,11 @@ tratamiento sean idénticos antes y después.
 - **FR-015**: El sistema DEBE exigir que los candidatos de periodo de segmentación y el criterio de
   elección estén declarados en la configuración antes de ejecutar el análisis de estabilidad.
 - **FR-016**: El sistema DEBE comparar el año 2 contra el año 1, el año 3 contra el promedio simple
-  de los años 1 y 2, y el año 4 contra el promedio simple de los años 1 a 3.
+  de los años 1 y 2, y el año 4 contra el promedio simple de los años 1 a 3. La clase de
+  referencia de cada artículo se obtiene así: su gasto anual se promedia sobre los años previos
+  y se vuelve a clasificar ABC sobre ese promedio; su CV anual se promedia sobre los años previos
+  y se clasifica XYZ con los umbrales configurados. Solo cuentan en el promedio los años en que
+  el artículo estuvo activo (posteriores a su lanzamiento).
 - **FR-017**: El sistema DEBE calcular la matriz global de train y contrastarla con cada matriz
   anual mediante el porcentaje de artículos con la misma clase y el PSI sobre la proporción de
   clases, con umbrales configurables.
@@ -256,11 +267,13 @@ tratamiento sean idénticos antes y después.
   Justificación de la abstracción (Principio III, condición a): es una regla de negocio que
   cambia de forma independiente y tiene varias implementaciones reales.
 - **FR-019**: El sistema DEBE construir la lista de productos objetivo con los artículos de clase A
-  estables en train y asignar a cada uno un tratamiento según su gasto y su CV, siguiendo
-  [NEEDS CLARIFICATION: ¿qué tratamientos existen y qué celda o regla lleva a cada uno? Por
-  ejemplo, AX abastecimiento regular, AY abastecimiento con revisión, AZ prioridad de promoción].
+  estables en train y asignar a cada uno un tratamiento según su celda ABC × XYZ, con un mapeo
+  celda → tratamiento declarado en el archivo de configuración (parámetro `treatment_map`). Por
+  defecto: **AX** → abastecimiento regular (guiado por pronóstico), **AY** → abastecimiento con
+  revisión periódica, **AZ** → prioridad de promoción / revisión de demanda. Un producto objetivo
+  cuya celda no tenga tratamiento en el mapeo detiene el proceso.
 - **FR-020**: El sistema DEBE serializar y congelar la lista objetivo, su tratamiento, el periodo
-  de segmentación elegido, los cortes ABC, los umbrales XYZ, la agregación del CV y la regla de estabilidad. Las etapas siguientes DEBEN
+  de segmentación elegido, los cortes ABC, los umbrales XYZ, la agregación del CV, la regla de estabilidad y el mapeo de tratamientos. Las etapas siguientes DEBEN
   cargarlos sin recalcularlos.
 - **FR-021**: El análisis de estabilidad NO DEBE usar ningún dato del año 5.
 
@@ -271,6 +284,9 @@ tratamiento sean idénticos antes y después.
 - **FR-023**: El sistema DEBE comparar como candidatos las líneas base (seasonal naive y medias
   móviles), ARIMA y SARIMA, con candidatos de búsqueda declarados antes de experimentar.
 - **FR-024**: La selección de modelos y órdenes DEBE hacerse solo con backtesting dentro de train.
+  El nivel al que se elige el modelo (por producto, global o por grupo) se lee del parámetro
+  `selection_level`, cuyas etiquetas define el analista en la experimentación. El valor DEBE
+  declararse antes de ejecutar el backtesting y queda congelado con el modelo.
 - **FR-025**: El sistema DEBE evaluar en test cada modelo una única vez, en 13 orígenes cada 28 días,
   sin reentrenar y con parámetros fijos, actualizando solo los datos observados.
 - **FR-026**: El sistema DEBE convertir la participación a unidades usando el total real de la
@@ -361,7 +377,9 @@ elegido supera al seasonal naive.
   corte A; así el artículo que cruza el 80 % queda en A. Ídem para B.
 - **Límites XYZ:** se usa X < 10 %, 10 % ≤ Y < 25 %, Z ≥ 25 %. La descripción original decía
   "Z > 25 %", lo que dejaba sin clase un CV de exactamente 25 %.
-- **Promedio de referencia:** promedio simple de las distribuciones de los años previos.
+- **Promedio de referencia:** promedio simple de las distribuciones de los años previos (para
+  PSI) y, por artículo, promedio simple de su gasto y CV anuales en los años previos activos
+  (ver FR-016).
 - **Ponderación del WRMSSE:** sigue la definición de Makridakis et al. (2022), con pesos por gasto
   estimado de los últimos 28 días de train y escala por el error naive de un paso en train.
 - **Periodo de segmentación:** intervalo dentro del año (por ejemplo, trimestre o cuatrimestre),
@@ -370,6 +388,7 @@ elegido supera al seasonal naive.
 - **Pendientes que se resuelven en el plan o la experimentación:** valor del periodo de uso,
   umbrales PSI y de acuerdo, significado y cobertura de `wm_yr_wk`, forma de serialización,
   redondeo al convertir participación a unidades, ventanas de medias móviles en días, tamaño del
-  subconjunto y candidatos de búsqueda, y versiones de Python y librerías.
+  subconjunto y candidatos de búsqueda, etiquetas de `selection_level` (nivel de selección del
+  modelo), y versiones de Python y librerías.
 - **Referencias:** Makridakis et al. (2022) para WRMSSE; las fuentes para ABC-XYZ, umbrales y
   estabilidad se citan en el plan.
