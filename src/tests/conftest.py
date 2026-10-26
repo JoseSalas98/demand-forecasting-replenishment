@@ -173,7 +173,7 @@ def staged(workdir, tiny_cfg) -> dict:
     from src.segmentation import run_train_matrix
     from src.stability import run_stability_stage
 
-    run_data_validation(tiny_cfg)
+    run_data_validation(tiny_cfg, persist=True)
     run_train_matrix(tiny_cfg)
     out = run_stability_stage(tiny_cfg)
     return {"cfg": tiny_cfg, "root": workdir, **out}
