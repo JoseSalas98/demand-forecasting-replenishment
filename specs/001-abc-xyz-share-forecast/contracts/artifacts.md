@@ -18,11 +18,12 @@ los registra en el manifiesto. `load_frozen()` verifica el hash y se detiene si 
 | `data/processed/matrix_y5.parquet` | sí | Mismas columnas que `matrix_train` más `set_id = "Y5"`. Solo diagnóstico; ninguna etapa de selección la lee. |
 | `data/processed/stability_y5.parquet` | sí | `comparison (= "Y5"), dimension, agreement_pct_vs_ref, agreement_pct_vs_global, psi, psi_band` |
 | `data/processed/year5_replication.parquet` | sí | `item_id, frozen_cell, ref_abc, ref_xyz, y5_abc, y5_xyz, y5_cell, same_abc, same_xyz, same_cell, same_as_frozen` (solo productos objetivo) |
-| `models/frozen_models.json` | sí | `[{selection_unit, item_ids[], candidate_id, family, order, seasonal_order, params[]}]` |
+| `models/frozen_models.json` | sí | `[{selection_unit, item_ids[], candidate_id, family, hyperparams, order, seasonal_order, trend, scale, params[]}]` (más `window` en la media móvil) |
+| `models/baseline_models.json` | sí | Seasonal naive ajustado en todo train para cada objetivo, mismo formato que `frozen_models.json` |
 | `models/fit_failures.parquet` | no | `item_id, candidate_id, stage, message` |
 | `data/processed/backtest_scores.parquet` | sí | `selection_unit, candidate_id, fold, rmsse_mean` |
 | `data/processed/forecasts_test.parquet` | no | `model_id, item_id, origin, h, d, share_hat, units_hat, units_actual` |
-| `data/processed/evaluation.parquet` | no | `model_id, wrmsse, wape, rmse, beats_snaive` más `wrmsse_o1 … wrmsse_o13` |
+| `data/processed/evaluation.parquet` | no | `model_id, wrmsse, wape, rmse, beats_snaive, n_items, excluded` más `wrmsse_o1 … wrmsse_o13` |
 | `reports/eda_five_years/` | no | Salida descriptiva de la etapa 2 (primera etapa de análisis). Ninguna etapa de decisión la lee. |
 
 ## `data/processed/manifest.json`
