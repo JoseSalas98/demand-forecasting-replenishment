@@ -13,7 +13,7 @@ from src.stability import replicate_year5, run_replication
 
 
 def test_stops_without_frozen_targets(workdir, tiny_cfg):
-    run_data_validation(tiny_cfg)
+    run_data_validation(tiny_cfg, persist=True)
     with pytest.raises(RuntimeError, match="targets"):
         run_replication(tiny_cfg)
 
