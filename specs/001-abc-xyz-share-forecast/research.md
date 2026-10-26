@@ -130,7 +130,11 @@ está definido) no tiene tratamiento, el proceso se detiene.
   | ARIMA | p, q ∈ {0, 1, 2}, d ∈ {0, 1} |
   | SARIMA | grilla ARIMA × (P, D, Q) ∈ {0, 1}³, s = 7 |
 
-  Todos los candidatos usan `SARIMAX` de statsmodels sin variables exógenas.
+  Seasonal naive, ARIMA y SARIMA usan `SARIMAX` de statsmodels sin variables exógenas (con
+  constante cuando d = D = 0). La media móvil no es un modelo `SARIMAX`: se calcula de forma
+  cerrada y su "parámetro congelado" es la ventana. La serie se normaliza por su media positiva
+  de train (guardada como `scale` en el modelo congelado) para estabilizar el optimizador, y la
+  participación pronosticada se recorta a ≥ 0.
 - **Backtest**: `backtest_folds = 4` folds de 28 días sin solapamiento que terminan en d_1577
   (d_1466–d_1577). Cada candidato se ajusta una vez con los datos previos al primer fold. Los
   folds siguientes solo añaden observaciones (`smooth` con parámetros fijos), igual que el
