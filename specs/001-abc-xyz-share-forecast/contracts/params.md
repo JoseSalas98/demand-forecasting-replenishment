@@ -42,7 +42,7 @@ AX = "regular_replenishment"
 AY = "periodic_review_replenishment"
 AZ = "promotion_priority"
 
-[forecast]
+[forecast]                           # se declara antes de la réplica en el año 5; cambiarlo después exige nueva version
 selection_level = "item"             # etiquetas definidas por el analista durante la experimentación
 subset_size = "all"                  # "all" o entero N (los N primeros por gasto en train)
 backtest_folds = 4

@@ -26,19 +26,58 @@ uno al gasto estimado? ¿Cuáles necesitan más promoción?
 - Q: ¿Cómo se identifica la fecha de lanzamiento de un artículo? → A: Primera `wm_yr_wk` con precio en el archivo de precios, por tienda; el artículo agregado empieza en el lanzamiento más temprano entre tiendas.
 - Q: ¿El modelo se elige por producto objetivo o por grupo? → A: No se fija en la spec; es el parámetro `selection_level`, cuyas etiquetas define el analista durante la experimentación, declarado antes del backtesting y congelado con el modelo.
 
+### Session 2026-10-26
+
+- Q: ¿En qué orden se ejecutan la exploración de cinco años, el análisis sobre train, la mirada al año 5 y el pronóstico? → A: Primero la exploración descriptiva global de los cinco años; después la matriz y la estabilidad sobre train, cuyo resultado se congela; luego se replica sobre el año 5 lo congelado; y recién después se hace el pronóstico (backtesting en train y evaluación única en test).
+- Q: ¿Cómo se evita que la réplica en el año 5 influya en la elección del modelo? → A: Los candidatos de pronóstico y `selection_level` se declaran antes de la réplica; cambiarlos después exige una nueva versión. La réplica no modifica la lista ni el tratamiento, y ninguna etapa de selección la lee.
+- Q: ¿Qué calcula la réplica en el año 5? → A: La matriz ABC × XYZ del año 5 con los cortes, umbrales y agregación del CV congelados; el acuerdo y el PSI del año 5 frente al promedio de los años 1 a 4 y frente a la matriz global de train; y, por producto objetivo, si mantiene su clase y su celda.
+
+## Orden de ejecución
+
+Las historias están numeradas en el orden en que se ejecutan:
+
+1. Exploración descriptiva de cinco años (US1).
+2. Matriz ABC × XYZ sobre train, congelada (US2).
+3. Estabilidad, lista objetivo y tratamiento, congelados (US3).
+4. Declaración de los candidatos de pronóstico y de `selection_level`, y réplica en el año 5 (US4).
+5. Backtesting en train y evaluación única en test (US5).
+
 ## User Scenarios & Testing *(mandatory)*
 
 Actor principal: analista de categoría o abastecimiento que decide qué artículos priorizar en
 promoción y abastecimiento. Todos los artículos se analizan agregados sobre todas las tiendas.
 
-### User Story 1 - Ranking y matriz ABC × XYZ sobre train (Priority: P1)
+### User Story 1 - Exploración descriptiva de cinco años (Priority: P1)
+
+El analista describe primero los productos con los cinco años: ABC por gasto, XYZ,
+distribuciones, proporción de ceros, media frente a mediana, y estabilidad anual y global. Es solo
+descriptivo.
+
+**Why this priority**: es la primera etapa del análisis y da el contexto global antes de trabajar
+sobre la partición de train. No decide nada del modelo.
+
+**Independent Test**: se genera el informe descriptivo y se verifica que ningún corte, candidato,
+periodo, lista o partición dependa de él.
+
+**Acceptance Scenarios**:
+
+1. **Given** los cinco años de datos validados, **When** se genera la exploración, **Then** el
+   informe incluye las descripciones listadas.
+2. **Given** la exploración terminada, **When** se ejecutan las etapas siguientes, **Then** ninguna
+   lee su salida para decidir cortes, umbrales, periodos, lista objetivo ni modelos.
+3. **Given** la matriz de train congelada (US2), **When** se compara con la exploración, **Then**
+   cada diferencia se reporta como hallazgo y la matriz congelada no cambia.
+
+---
+
+### User Story 2 - Ranking y matriz ABC × XYZ sobre train (Priority: P2)
 
 El analista obtiene el ranking de artículos por gasto estimado y por variabilidad de unidades, con
 la clase ABC, la clase XYZ y la celda de la matriz ABC × XYZ de cada artículo, calculado solo con
 datos de train (años 1 a 4).
 
-**Why this priority**: es la base de todo lo demás. Por sí sola responde cuánto aporta cada
-artículo al gasto estimado y cuáles son de demanda estable o errática.
+**Why this priority**: es la base de todas las decisiones. Responde cuánto aporta cada artículo al
+gasto estimado y cuáles son de demanda estable o errática, solo con train.
 
 **Independent Test**: con los datos de train y la configuración por defecto, se genera la matriz.
 Se verifica a mano, para una muestra de artículos, el gasto (unidades × precio de cada
@@ -61,7 +100,7 @@ tienda-semana), el porcentaje acumulado, el CV y la clase asignada.
 
 ---
 
-### User Story 2 - Estabilidad estacional, lista objetivo y tratamiento (Priority: P2)
+### User Story 3 - Estabilidad estacional, lista objetivo y tratamiento (Priority: P3)
 
 El analista evalúa con datos de train si la clasificación de cada artículo se mantiene año a año y
 dentro de los periodos de segmentación candidatos. Con eso obtiene la lista congelada de productos
@@ -69,7 +108,7 @@ objetivo (clase A y estables en train) y el tratamiento de cada uno según su ga
 predictibilidad (CV).
 
 **Why this priority**: decide sobre qué artículos se modela y cómo se tratan. Sin esta lista no
-existe el pronóstico del RMV.
+existen la réplica en el año 5 ni el pronóstico del RMV.
 
 **Independent Test**: con la matriz de train congelada, se ejecuta el análisis de estabilidad.
 Se verifica que solo use los años 1 a 4, que las comparaciones sigan el esquema declarado y que
@@ -94,14 +133,42 @@ la lista resultante solo contenga artículos de clase A que cumplen el criterio 
 
 ---
 
-### User Story 3 - Pronóstico de participación a 28 días evaluado en test (Priority: P3)
+### User Story 4 - Réplica sobre el año 5 de lo congelado en train (Priority: P4)
+
+Con la lista objetivo congelada y los candidatos de pronóstico ya declarados, el analista replica
+sobre el año 5 la matriz ABC × XYZ y la estabilidad con los cortes, umbrales y agregación
+congelados en train, antes de pronosticar.
+
+**Why this priority**: muestra, antes de pronosticar, si la segmentación congelada en train se
+sostiene en el periodo de test, sin cambiarla.
+
+**Independent Test**: se ejecuta con la lista congelada y los candidatos de pronóstico declarados.
+Se verifica que la lista, el tratamiento y los candidatos sean idénticos antes y después, y que
+ninguna etapa de selección de modelos lea el resultado.
+
+**Acceptance Scenarios**:
+
+1. **Given** la lista objetivo congelada y los candidatos de pronóstico y `selection_level`
+   declarados, **When** se ejecuta la réplica, **Then** se calcula la matriz ABC × XYZ del año 5
+   con los parámetros congelados, el acuerdo y el PSI del año 5 frente al promedio de los años 1 a
+   4 y frente a la matriz global de train, y por producto objetivo si mantiene su clase y su
+   celda. La lista y el tratamiento no cambian.
+2. **Given** que la lista objetivo no está congelada o que los candidatos de pronóstico no están
+   declarados, **When** se pide la réplica, **Then** el proceso se detiene y lo indica.
+3. **Given** la réplica terminada, **When** se ejecuta el backtesting, **Then** ninguna etapa de
+   selección lee el resultado de la réplica ni datos del año 5.
+
+---
+
+### User Story 5 - Pronóstico de participación a 28 días evaluado en test (Priority: P5)
 
 El analista obtiene para cada producto objetivo de clase A el pronóstico de su participación en
 unidades a 28 días con el mejor modelo entre las líneas base (seasonal naive y medias móviles),
 ARIMA y SARIMA. El modelo se elige solo con backtesting en train y se evalúa una única vez en el
 test (año 5, 13 orígenes cada 28 días, sin solapamiento).
 
-**Why this priority**: cierra el RMV. Depende de la lista congelada de la historia 2.
+**Why this priority**: es la última etapa y cierra el RMV. Depende de la lista congelada (US3) y
+de la réplica en el año 5 (US4).
 
 **Independent Test**: con la lista congelada, se ejecuta la selección en train y la evaluación en
 test. Se verifica que el WRMSSE del modelo elegido sea menor que el del seasonal naive en el
@@ -109,58 +176,21 @@ mismo conjunto y los mismos 13 orígenes.
 
 **Acceptance Scenarios**:
 
-1. **Given** los candidatos de búsqueda declarados antes de experimentar, **When** se ejecuta el
-   backtesting en train, **Then** se elige un modelo al nivel indicado en `selection_level` usando solo train, y el
-   modelo y sus parámetros quedan congelados.
-2. **Given** el modelo congelado, **When** se evalúa en test, **Then** se producen pronósticos en
+1. **Given** los candidatos de búsqueda declarados antes de la réplica en el año 5, **When** se
+   ejecuta el backtesting en train, **Then** se elige un modelo al nivel indicado en
+   `selection_level` usando solo train, y el modelo y sus parámetros quedan congelados.
+2. **Given** un candidato de búsqueda cambiado después de la réplica en el año 5, **When** se pide
+   el backtesting, **Then** el proceso se detiene y exige una nueva versión.
+3. **Given** el modelo congelado, **When** se evalúa en test, **Then** se producen pronósticos en
    13 orígenes consecutivos cada 28 días, sin reentrenar. Solo se actualizan los datos observados
    y los parámetros se mantienen fijos.
-3. **Given** los pronósticos de participación, **When** se convierten a unidades, **Then** se usa
+4. **Given** los pronósticos de participación, **When** se convierten a unidades, **Then** se usa
    el total real de unidades de la cadena del periodo; el total de la cadena no se pronostica.
-4. **Given** los resultados de test, **When** se compara con la línea base, **Then** el modelo
+5. **Given** los resultados de test, **When** se compara con la línea base, **Then** el modelo
    solo se acepta si su WRMSSE es menor que el del seasonal naive. WAPE y RMSE se reportan como
    diagnóstico sin umbral, y MAPE no se usa.
-5. **Given** un ajuste de modelo que falla, **When** ocurre el fallo, **Then** se registra con el
+6. **Given** un ajuste de modelo que falla, **When** ocurre el fallo, **Then** se registra con el
    artículo y el candidato, y el proceso continúa con los demás candidatos.
-
----
-
-### User Story 4 - Exploración descriptiva de cinco años (Priority: P4)
-
-El analista describe los productos con los cinco años: ABC por gasto, XYZ, distribuciones,
-proporción de ceros, media frente a mediana, y estabilidad anual y global. Es solo descriptivo.
-
-**Why this priority**: da contexto y hallazgos, pero no decide nada del modelo.
-
-**Independent Test**: se genera el informe descriptivo y se verifica que ningún corte, candidato,
-periodo, lista o partición dependa de él.
-
-**Acceptance Scenarios**:
-
-1. **Given** los cinco años de datos, **When** se genera la exploración, **Then** el informe
-   incluye las descripciones listadas y marca como hallazgo cada diferencia con la matriz de
-   train.
-2. **Given** una diferencia entre la exploración y la matriz de train, **When** se reporta,
-   **Then** la matriz congelada no cambia.
-
----
-
-### User Story 5 - Diagnóstico posterior del año 5 (Priority: P5)
-
-Después de evaluar el test, el analista recibe la estabilidad de cada producto objetivo congelado
-en el año 5.
-
-**Why this priority**: informa la confianza en la lista para la siguiente iteración, sin cambiarla.
-
-**Independent Test**: se ejecuta después de la evaluación en test y se verifica que la lista y el
-tratamiento sean idénticos antes y después.
-
-**Acceptance Scenarios**:
-
-1. **Given** la evaluación en test terminada, **When** se calcula el diagnóstico, **Then** se
-   reporta la estabilidad del año 5 de cada producto objetivo y la lista congelada no cambia.
-2. **Given** que la evaluación en test no terminó, **When** se pide el diagnóstico, **Then** el
-   proceso se detiene y lo indica.
 
 ---
 
@@ -181,12 +211,14 @@ tratamiento sean idénticos antes y después.
 - **Día con total de unidades de la cadena igual a cero:** la participación está indefinida; el día
   se registra y no entra en el cálculo de participación.
 - **Lista objetivo vacía:** el proceso se detiene y lo reporta. No se relajan criterios después de
-  ver el test.
+  ver el año 5.
+- **Producto objetivo que cambia de clase en el año 5:** se reporta en la réplica; la lista y el
+  tratamiento no cambian.
 - **Ningún modelo supera al seasonal naive:** el RMV no se cierra; se reporta el resultado.
 - **Parámetro fuera de rango** (cortes ABC no crecientes, umbrales XYZ negativos o no crecientes,
   umbrales PSI negativos): el proceso se detiene antes de calcular.
-- **Cambio de parámetro después de ver el test:** exige una nueva versión y repetir desde la matriz
-  sobre train.
+- **Cambio de parámetro después de la réplica en el año 5 o de ver el test:** exige una nueva
+  versión y repetir desde la matriz sobre train.
 
 ## Requirements *(mandatory)*
 
@@ -282,11 +314,12 @@ tratamiento sean idénticos antes y después.
 - **FR-022**: El sistema DEBE pronosticar la participación en unidades a 28 días de cada producto
   objetivo de clase A: unidades del artículo agregado / unidades totales reales de la cadena.
 - **FR-023**: El sistema DEBE comparar como candidatos las líneas base (seasonal naive y medias
-  móviles), ARIMA y SARIMA, con candidatos de búsqueda declarados antes de experimentar.
+  móviles), ARIMA y SARIMA, con candidatos de búsqueda declarados antes de la réplica en el año 5
+  (FR-030). Un candidato cambiado después de la réplica DEBE detener el backtesting.
 - **FR-024**: La selección de modelos y órdenes DEBE hacerse solo con backtesting dentro de train.
   El nivel al que se elige el modelo (por producto, global o por grupo) se lee del parámetro
   `selection_level`, cuyas etiquetas define el analista en la experimentación. El valor DEBE
-  declararse antes de ejecutar el backtesting y queda congelado con el modelo.
+  declararse antes de la réplica en el año 5 y queda congelado con el modelo.
 - **FR-025**: El sistema DEBE evaluar en test cada modelo una única vez, en 13 orígenes cada 28 días,
   sin reentrenar y con parámetros fijos, actualizando solo los datos observados.
 - **FR-026**: El sistema DEBE convertir la participación a unidades usando el total real de la
@@ -295,12 +328,18 @@ tratamiento sean idénticos antes y después.
   diagnóstico. Un modelo DEBE rechazarse si su WRMSSE no es menor que el del seasonal naive.
 - **FR-028**: El sistema DEBE registrar cada fallo de ajuste con el artículo y el candidato.
 
-**Exploración, diagnóstico e informe**
+**Exploración, réplica en el año 5 e informe**
 
-- **FR-029**: El sistema DEBE producir una exploración descriptiva de cinco años que no alimente
-  ninguna decisión y que reporte como hallazgo sus diferencias con la matriz de train.
-- **FR-030**: Después de evaluar el test, el sistema DEBE reportar la estabilidad del año 5 de cada
-  producto objetivo sin modificar la lista ni el tratamiento.
+- **FR-029**: El sistema DEBE producir, como primera etapa del análisis y antes de la matriz sobre
+  train, una exploración descriptiva de cinco años que no alimente ninguna decisión. Sus
+  diferencias con la matriz de train congelada se reportan como hallazgo.
+- **FR-030**: Una vez congelados la lista objetivo y su tratamiento (FR-020), y declarados los
+  candidatos de pronóstico y `selection_level` (FR-023, FR-024), y antes del backtesting, el
+  sistema DEBE replicar sobre el año 5 la matriz ABC × XYZ con los cortes, umbrales y agregación
+  del CV congelados, y reportar el acuerdo y el PSI del año 5 frente al promedio de los años 1 a 4
+  y frente a la matriz global de train, y por producto objetivo si mantiene su clase y su celda.
+  La réplica NO DEBE modificar la lista, el tratamiento ni los candidatos, y ninguna etapa de
+  selección de modelos DEBE leerla.
 - **FR-031**: El informe final DEBE presentar los resultados como backtesting sobre datos
   históricos, con la advertencia de sesgo de selección: valen para el subconjunto evaluado, no
   para todo el catálogo.
@@ -318,6 +357,8 @@ tratamiento sean idénticos antes y después.
   global, año o periodo de segmentación).
 - **Medida de estabilidad**: porcentaje de acuerdo y PSI entre una matriz y su referencia.
 - **Producto objetivo**: artículo de clase A estable en train, con su tratamiento. Congelado.
+- **Réplica del año 5**: matriz y estabilidad del año 5 calculadas con los parámetros congelados,
+  y permanencia de clase y celda de cada producto objetivo. Solo diagnóstico.
 - **Configuración**: parámetros con valor por defecto e historial de cambios.
 - **Registro de rechazos y fallos**: motivo, fila, fuente, o artículo y candidato del modelo.
 - **Pronóstico**: participación y unidades por producto objetivo, origen y día del horizonte.
@@ -334,15 +375,16 @@ tratamiento sean idénticos antes y después.
   acumulado, el CV y la clase coinciden con el cálculo reportado.
 - **SC-004**: Repetir el proceso con la misma configuración produce la misma matriz, la misma lista
   objetivo y el mismo tratamiento.
-- **SC-005**: La lista objetivo y su tratamiento tienen fecha de congelamiento anterior a la primera
-  evaluación en test, y ninguna decisión usa datos del año 5.
+- **SC-005**: La lista objetivo, su tratamiento y la declaración de los candidatos de pronóstico
+  tienen fecha anterior a la réplica en el año 5, y la réplica tiene fecha anterior al
+  backtesting y a la primera evaluación en test. Ninguna decisión usa datos del año 5.
 - **SC-006**: El modelo elegido tiene un WRMSSE menor que el del seasonal naive sobre los mismos
   productos objetivo y los mismos 13 orígenes.
 - **SC-007**: Cada modelo se evalúa en test exactamente una vez.
 - **SC-008**: Con el informe final, un analista identifica para cada producto objetivo su clase,
   su aporte al gasto estimado, su tratamiento y su pronóstico, sin consultar otra fuente.
 - **SC-009**: El informe incluye la advertencia de backtesting y sesgo de selección, WAPE y RMSE
-  como diagnóstico, y la estabilidad del año 5 del 100 % de los productos objetivo.
+  como diagnóstico, y la réplica en el año 5 del 100 % de los productos objetivo.
 
 ## Entregables
 
@@ -379,7 +421,7 @@ elegido supera al seasonal naive.
   "Z > 25 %", lo que dejaba sin clase un CV de exactamente 25 %.
 - **Promedio de referencia:** promedio simple de las distribuciones de los años previos (para
   PSI) y, por artículo, promedio simple de su gasto y CV anuales en los años previos activos
-  (ver FR-016).
+  (ver FR-016). Para la réplica en el año 5, los años previos son los años 1 a 4.
 - **Ponderación del WRMSSE:** sigue la definición de Makridakis et al. (2022), con pesos por gasto
   estimado de los últimos 28 días de train y escala por el error naive de un paso en train.
 - **Periodo de segmentación:** intervalo dentro del año (por ejemplo, trimestre o cuatrimestre),

@@ -176,6 +176,8 @@ la primera demanda no nula), restringidas al conjunto objetivo.
   detiene si cambió.
 - La evaluación en test exige que las marcas de congelamiento del manifiesto sean anteriores a la
   ejecución.
+- El backtest exige que las declaraciones de `[forecast]` sean anteriores al `frozen_at` de
+  `matrix_y5` y que sus valores coincidan con la config actual (R13).
 - `TestLedger` (`data/processed/test_ledger.json`) rechaza una segunda evaluación del mismo
   `model_id` (SC-007).
 
@@ -199,3 +201,46 @@ archivos de este tamaño).
 **Decisión**: Python 3.12. Añadir statsmodels y pyarrow a `ds` y pytest a `dev` con
 `uv add --group`. Las versiones exactas son las que resuelva `uv.lock` al añadirlas, y se
 registran en el reporte final.
+
+## R13. Orden de etapas y réplica en el año 5
+
+**Decisión**: las etapas se ejecutan en este orden (constitución v1.1.0, spec "Orden de
+ejecución"):
+
+| # | Etapa | Notebook | Datos que lee |
+|---|---|---|---|
+| 1 | Validación de datos | `01_data_validation` | d_1–d_1941 (solo validación) |
+| 2 | EDA de cinco años | `02_eda_five_years` | d_122–d_1941 (Y1–Y5), solo descriptivo |
+| 3 | Matriz ABC × XYZ de train | `03_abc_xyz_train` | ≤ d_1577 |
+| 4 | Estabilidad y lista objetivo | `04_stability_target_list` | ≤ d_1577 |
+| 5 | Declaración de `[forecast]` y réplica en Y5 | `05_year5_replication` | d_1578–d_1941 más lo congelado |
+| 6 | Backtesting | `06_backtesting` | ≤ d_1577 |
+| 7 | Evaluación en test | `07_test_evaluation` | d_1–d_1941 |
+| 8 | Informe final | `08_final_report` | artefactos |
+
+La réplica (etapa 5) usa los cortes, umbrales, `cv_aggregation` y `treatment_map` congelados en
+la etapa 4 y calcula:
+- la matriz ABC × XYZ de Y5 (d_1578–d_1941) para todos los artículos (`matrix_y5`);
+- el acuerdo y el PSI de Y5 frente a la referencia (promedio de los años activos Y1–Y4, con la
+  misma regla de R6) y frente a `matrix_train` (`stability_y5`);
+- por producto objetivo, su clase y celda en Y5, su referencia y si coincide con lo congelado
+  (`year5_replication`).
+
+Resguardos:
+- La etapa 5 exige que `targets` y `segmentation_params` estén congelados, y registra las
+  declaraciones de todas las claves de `[forecast]` antes de leer cualquier día de Y5.
+- El backtest (etapa 6) se detiene si alguna declaración de `[forecast]` es posterior al
+  `frozen_at` de `matrix_y5` o si su valor difiere de la config actual. Cambiarla exige una nueva
+  `version` y repetir desde la etapa 3.
+- Las etapas 3, 4 y 6 usan `assert_train_only` y no leen `reports/eda_five_years/` ni los
+  artefactos de la réplica.
+
+**Razón**: la exploración global da contexto antes de trabajar sobre train. Replicar en Y5 antes
+de pronosticar muestra si la segmentación congelada se sostiene en el periodo que se va a
+pronosticar. Declarar antes los candidatos evita que lo visto en Y5 influya en la elección del
+modelo.
+
+**Alternativas**: diagnóstico del año 5 después del test (orden original de la v1.0.0; deja la
+información sobre la segmentación en Y5 para después del pronóstico, lo que no corresponde al
+flujo de análisis); réplica antes del pronóstico sin declarar antes los candidatos (más flexible,
+pero lo visto en Y5 podría sesgar la elección del modelo).
