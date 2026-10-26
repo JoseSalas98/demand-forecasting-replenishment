@@ -3,14 +3,20 @@ import pandas as pd
 import pytest
 
 from src.data import (
+    INTERIM_DIR,
+    MASK_REASONS,
     aggregate_items,
     apply_masks,
     assert_train_only,
+    audit_series,
     build_daily_prices,
     compute_launch,
     load_calendar,
     load_prices,
     load_sales,
+    mask_summary,
+    run_data_validation,
+    save_data_validation,
     validate_calendar,
     week_of_day,
 )
@@ -26,7 +32,7 @@ def pipeline(workdir, tiny_cfg):
     wod = week_of_day(calendar, last_day)
     prices_daily = build_daily_prices(prices, wod, series_index)
     launch = compute_launch(prices_daily, series_index, wod)
-    masked_units, masked_prices, log = apply_masks(
+    masked_units, masked_prices, log, mask_reason = apply_masks(
         units, prices_daily, launch, series_index, wod, prices, tiny_cfg["data"]["sales_file"]
     )
     agg = aggregate_items(masked_units, masked_prices, series_index, launch)
@@ -38,6 +44,7 @@ def pipeline(workdir, tiny_cfg):
         "masked_units": masked_units,
         "masked_prices": masked_prices,
         "log": log,
+        "mask_reason": mask_reason,
         "agg": agg,
         "wod": wod,
     }
@@ -110,7 +117,9 @@ def test_sales_before_first_price_logged(workdir, tiny_cfg, raw_frames):
     wod = week_of_day(calendar, 287)
     pdaily = build_daily_prices(prices, wod, si)
     launch = compute_launch(pdaily, si, wod)
-    _, _, log = apply_masks(units, pdaily, launch, si, wod, prices, tiny_cfg["data"]["sales_file"])
+    _, _, log, _ = apply_masks(
+        units, pdaily, launch, si, wod, prices, tiny_cfg["data"]["sales_file"]
+    )
     hit = log[log.reason == "sales_before_first_price"]
     assert list(hit.column) == ["d_3"]
 
@@ -139,3 +148,58 @@ def test_assert_train_only(tiny_cfg):
     assert_train_only(231, tiny_cfg)
     with pytest.raises(RuntimeError):
         assert_train_only(232, tiny_cfg)
+
+
+def test_mask_reason_matches_masks(pipeline):
+    """Cada celda en NaN tiene motivo y cada celda válida conserva el valor crudo."""
+    codes = pipeline["mask_reason"]
+    units, masked = pipeline["units"], pipeline["masked_units"]
+    np.testing.assert_array_equal(np.isnan(masked), codes > 0)
+    valid = codes == 0
+    np.testing.assert_array_equal(masked[valid], units[valid])
+    si = pipeline["series_index"]
+    name = {v: k for k, v in MASK_REASONS.items()}
+    # Prelanzamiento de TX_1/FOODS_C (lanzado el d_71); unidades inválidas en d_20 y d_21.
+    assert (codes[_row(si, "TX_1", "FOODS_C"), :70] == name["pre_launch"]).all()
+    assert codes[_row(si, "CA_1", "FOODS_B"), 19] == name["invalid_units"]
+    assert (codes[_row(si, "CA_1", "FOODS_D"), 35:42] == name["invalid_price_with_sales"]).all()
+    assert (codes[_row(si, "TX_1", "FOODS_D"), 42:49] == name["price_gap_no_sales"]).all()
+
+
+def test_mask_summary_counts_cells(pipeline):
+    summary = mask_summary(pipeline["mask_reason"], pipeline["units"], pipeline["series_index"])
+    assert summary["cells"].sum() == pipeline["units"].size
+    assert set(summary["reason"]) == set(MASK_REASONS.values())
+    row = summary.set_index("reason").loc["invalid_units"]
+    assert row["is_rejection"] and row["cells"] == 2
+
+
+def test_run_without_persist_writes_nothing(workdir, tiny_cfg):
+    result = run_data_validation(tiny_cfg)
+    assert result["persisted"] == []
+    assert not any(INTERIM_DIR.iterdir())
+    assert result["units_raw"].shape == result["units"].shape == result["mask_reason"].shape
+    written = save_data_validation(result)
+    assert all(p.exists() for p in written)
+    assert (INTERIM_DIR / "mask_reason.npy").exists()
+
+
+def test_audit_series_shows_raw_and_masked(workdir, tiny_cfg):
+    result = run_data_validation(tiny_cfg)
+    view = audit_series(result, "TX_1", "FOODS_C", 68, 73)
+    assert list(view["d"]) == [68, 69, 70, 71, 72, 73]
+    assert view.loc[view.d < 71, "units"].isna().all()
+    assert (view.loc[view.d < 71, "mask_reason"] == "pre_launch").all()
+    assert view.loc[view.d >= 71, "units"].notna().all()
+    with pytest.raises(KeyError):
+        audit_series(result, "XX_9", "FOODS_C")
+
+
+def test_profile_frame_counts_nulls_and_unique():
+    from src.data import profile_frame
+
+    df = pd.DataFrame({"a": [1, 2, 2, None], "b": ["x", "y", "z", "w"]})
+    prof = profile_frame(df)
+    assert list(prof.columns) == ["dtype", "nulls", "null_pct", "unique"]
+    assert prof.loc["a", "nulls"] == 1 and prof.loc["a", "null_pct"] == 25.0
+    assert prof.loc["a", "unique"] == 2 and prof.loc["b", "unique"] == 4

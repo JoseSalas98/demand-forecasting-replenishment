@@ -12,6 +12,18 @@ import pandas as pd
 INTERIM_DIR = Path("data/interim")
 LOG_COLUMNS = ["reason", "source", "row_id", "column", "detail"]
 
+# Motivo de cada celda (serie × día) en el arreglo `mask_reason`. Los nombres coinciden con los
+# `reason` del registro de rechazos. 0 = celda válida; cualquier otro código = celda en NaN.
+MASK_REASONS = {
+    0: "valid",
+    1: "pre_launch",  # antes de la primera semana con precio y sin ventas; no es rechazo
+    2: "sales_before_first_price",  # ventas antes del primer precio; rechazo
+    3: "invalid_units",  # unidades no enteras, negativas o faltantes; rechazo
+    4: "invalid_price_with_sales",  # semana sin precio válido y con ventas; rechazo
+    5: "price_gap_no_sales",  # semana sin precio válido y sin ventas; informativo
+}
+REJECTION_CODES = (2, 3, 4)
+
 
 def load_calendar(cfg: dict) -> pd.DataFrame:
     """Lee `calendar.csv` desde `data.raw_dir`.
@@ -183,17 +195,21 @@ def apply_masks(
     week_of_day_arr: np.ndarray,
     prices: pd.DataFrame,
     sales_file: str,
-) -> tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+) -> tuple[np.ndarray, np.ndarray, pd.DataFrame, np.ndarray]:
     """Enmascara prelanzamiento y datos inválidos, y registra cada rechazo (FR-002, research R3).
 
-    Casos:
-        - unidades no enteras o < 0 → celda NaN, `invalid_units`.
-        - unidades > 0 antes del primer precio → celda NaN, `sales_before_first_price`.
+    Casos (código de `mask_reason` entre paréntesis):
+        - prelanzamiento sin ventas → NaN sin registro (1, `pre_launch`).
+        - unidades > 0 antes del primer precio → celda NaN, `sales_before_first_price` (2).
+        - unidades no enteras, < 0 o faltantes → celda NaN, `invalid_units` (3).
         - precio faltante o ≤ 0 tras el lanzamiento con unidades > 0 en la semana → semana NaN,
-          `invalid_price_with_sales` (el gasto no se imputa).
+          `invalid_price_with_sales` (4; el gasto no se imputa).
         - precio faltante tras el lanzamiento con unidades = 0 → semana NaN, `price_gap_no_sales`
-          (informativo, no es rechazo).
-        - prelanzamiento sin precio → NaN sin registro.
+          (5; informativo, no es rechazo).
+
+    El registro tiene una fila por celda en los casos 2 y 3, y una fila por semana en los casos
+    4 y 5. `mask_reason` tiene el motivo de cada celda, así se puede contar y comparar el efecto
+    de cada regla sobre los arreglos.
 
     Parámetros:
         units (np.ndarray): unidades crudas (series × día).
@@ -205,8 +221,9 @@ def apply_masks(
         sales_file (str): nombre del archivo de ventas (fuente del registro).
 
     Retorno:
-        tuple[np.ndarray, np.ndarray, pd.DataFrame]: unidades enmascaradas, precios enmascarados
-        y registro con columnas `reason, source, row_id, column, detail`.
+        tuple[np.ndarray, np.ndarray, pd.DataFrame, np.ndarray]: unidades enmascaradas, precios
+        enmascarados, registro con columnas `reason, source, row_id, column, detail` y
+        `mask_reason` int8 (series × día) con los códigos de `MASK_REASONS`.
     """
     _n_series, n_days = units.shape
     day_idx = np.arange(n_days)
@@ -229,7 +246,16 @@ def apply_masks(
     week_len = np.diff(np.r_[week_starts, n_days])
     bad_week_days = np.repeat(bad_week, week_len, axis=1)
 
-    mask = pre | bad_units | bad_week_days
+    # Códigos por celda; el orden de asignación define la precedencia (el último gana).
+    mask_reason = np.zeros(units.shape, dtype=np.int8)
+    post = ~pre
+    mask_reason[bad_week_days & post & np.repeat(~sold_week, week_len, axis=1)] = 5
+    mask_reason[bad_week_days & post & np.repeat(sold_week, week_len, axis=1)] = 4
+    mask_reason[pre] = 1
+    mask_reason[before_price] = 2
+    mask_reason[bad_units] = 3
+
+    mask = mask_reason > 0
     masked_units = np.where(mask, np.nan, units).astype(np.float32)
     masked_prices = np.where(mask, np.nan, prices_daily).astype(np.float32)
 
@@ -285,7 +311,7 @@ def apply_masks(
         logs.append(_log(reason, source, row_id, [f"wm_yr_wk={wk}" for wk in wks], detail))
     log = pd.concat(logs, ignore_index=True) if logs else pd.DataFrame(columns=LOG_COLUMNS)
     log["row_id"] = log["row_id"].astype("int64")
-    return masked_units, masked_prices, log[LOG_COLUMNS]
+    return masked_units, masked_prices, log[LOG_COLUMNS], mask_reason
 
 
 def aggregate_items(
@@ -423,30 +449,236 @@ def assert_train_only(max_day: int, cfg: dict) -> None:
         )
 
 
-def run_data_validation(cfg: dict) -> dict:
-    """Ejecuta la etapa 1 completa y guarda los intermedios.
+def profile_frame(df: pd.DataFrame) -> pd.DataFrame:
+    """Diagnóstico rápido por columna: tipo, nulos explícitos y valores distintos.
+
+    Sirve para revisar cualquier tabla cargada o unida; los nulos implícitos (filas ausentes,
+    como una semana sin precio) no aparecen aquí hasta que un merge los vuelve explícitos.
+
+    Parámetros:
+        df (pd.DataFrame): tabla a describir.
+
+    Retorno:
+        pd.DataFrame: una fila por columna de `df` con `dtype`, `nulls`, `null_pct` (0–100,
+        dos decimales) y `unique` (sin contar nulos).
+    """
+    nulls = df.isna()
+    return pd.DataFrame(
+        {
+            "dtype": df.dtypes.astype(str),
+            "nulls": nulls.sum(),
+            "null_pct": (nulls.mean() * 100).round(2),
+            "unique": df.nunique(),
+        }
+    )
+
+
+def mask_summary(
+    mask_reason: np.ndarray, units_raw: np.ndarray, series_index: pd.DataFrame
+) -> pd.DataFrame:
+    """Resume cuántas celdas, series y artículos enmascara cada regla y cuántas unidades quita.
+
+    Sirve para auditar el efecto de las máscaras: por ejemplo, ver que `pre_launch` concentra
+    la mayoría de las celdas en NaN y que los rechazos son pocos y explicables.
+
+    Parámetros:
+        mask_reason (np.ndarray): códigos por celda (salida de `apply_masks`).
+        units_raw (np.ndarray): unidades crudas, antes de enmascarar.
+        series_index (pd.DataFrame): orden de las series (`store_id, item_id`).
+
+    Retorno:
+        pd.DataFrame: una fila por código con `code, reason, is_rejection, cells, pct_cells,
+        series, items, units_removed` (unidades crudas finitas que quedan en NaN).
+    """
+    items = series_index["item_id"].to_numpy()
+    raw = np.nan_to_num(units_raw, nan=0.0, posinf=0.0, neginf=0.0)
+    rows = []
+    for code, reason in MASK_REASONS.items():
+        hit = mask_reason == code
+        series_hit = hit.any(axis=1)
+        rows.append(
+            {
+                "code": code,
+                "reason": reason,
+                "is_rejection": code in REJECTION_CODES,
+                "cells": int(hit.sum()),
+                "pct_cells": float(hit.mean() * 100),
+                "series": int(series_hit.sum()),
+                "items": int(pd.unique(items[series_hit]).size),
+                "units_removed": float(raw[hit].sum()) if code else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def audit_series(
+    result: dict,
+    store_id: str,
+    item_id: str,
+    start_d: int | None = None,
+    end_d: int | None = None,
+) -> pd.DataFrame:
+    """Muestra día a día una serie tienda-artículo antes y después de las máscaras.
+
+    Permite comprobar a mano que cada regla hace lo que dice, por ejemplo alrededor del
+    lanzamiento o en una semana sin precio.
+
+    Parámetros:
+        result (dict): salida de `run_data_validation`.
+        store_id (str): tienda.
+        item_id (str): artículo.
+        start_d (int | None): primer día (base 1); por defecto, el primero.
+        end_d (int | None): último día (inclusivo); por defecto, el último.
+
+    Retorno:
+        pd.DataFrame: `d, date, wm_yr_wk, units_raw, price_raw, mask_reason, units, price`.
+        Lanza KeyError si la serie no existe.
+    """
+    si = result["series_index"]
+    hits = np.flatnonzero((si["store_id"] == store_id).to_numpy() & (si["item_id"] == item_id))
+    if not len(hits):
+        raise KeyError(f"No existe la serie {store_id}/{item_id}.")
+    i = int(hits[0])
+    n_days = result["units"].shape[1]
+    a, b = (start_d or 1), (end_d or n_days)
+    cols = slice(a - 1, b)
+    cal = result["calendar"].assign(d_num=lambda c: c["d"].str.removeprefix("d_").astype(int))
+    dates = cal.set_index("d_num")["date"].reindex(range(a, b + 1)).to_numpy()
+    codes = result["mask_reason"][i, cols]
+    return pd.DataFrame(
+        {
+            "d": np.arange(a, b + 1),
+            "date": dates,
+            "wm_yr_wk": result["week_of_day"][cols],
+            "units_raw": result["units_raw"][i, cols],
+            "price_raw": result["prices_daily_raw"][i, cols],
+            "mask_reason": [MASK_REASONS[int(c)] for c in codes],
+            "units": result["units"][i, cols],
+            "price": result["prices_daily"][i, cols],
+        }
+    )
+
+
+def save_data_validation(result: dict) -> list[Path]:
+    """Guarda en `data/interim/` lo que leen las etapas siguientes.
+
+    Escribe las unidades y precios enmascarados, `week_of_day`, el agregado por artículo, el
+    total de la cadena, `series_index`, `launch`, `rejections` y `mask_reason`. No guarda los
+    arreglos crudos: esos se releen desde `data/raw/` (FR-001).
+
+    Parámetros:
+        result (dict): salida de `run_data_validation`.
+
+    Retorno:
+        list[Path]: archivos escritos.
+    """
+    arrays, tables = interim_from_aggregate(result["agg"])
+    arrays.update(
+        {
+            "units": result["units"],
+            "prices_daily": result["prices_daily"],
+            "week_of_day": result["week_of_day"],
+            "mask_reason": result["mask_reason"],
+        }
+    )
+    tables.update(
+        {
+            "series_index": result["series_index"],
+            "launch": result["launch"],
+            "rejections": result["rejections"],
+        }
+    )
+    save_interim(arrays, tables)
+    return [INTERIM_DIR / f"{n}.npy" for n in arrays] + [
+        INTERIM_DIR / f"{n}.parquet" for n in tables
+    ]
+
+
+def run_data_validation(cfg: dict, persist: bool = False) -> dict:
+    """Etapa 1: lee los CSV de M5, valida, enmascara datos inválidos y agrega por artículo.
+
+    Qué hace, en orden:
+        1. Lee y valida el calendario (fechas continuas, un `wm_yr_wk` por día); si falla, se
+           detiene (FR-003).
+        2. Lee las ventas como arreglo ancho (serie tienda-artículo × día) y los precios
+           semanales, y expande el precio a cada día de su semana.
+        3. Calcula el lanzamiento de cada serie: la primera semana con precio (FR-004).
+        4. Enmascara (pone en NaN) prelanzamiento, unidades inválidas y semanas sin precio
+           válido, y registra cada rechazo con motivo, fila y fuente (FR-002).
+        5. Agrega por artículo (suma de tiendas) las unidades y el gasto (unidades × precio por
+           tienda-día), y calcula el total diario de la cadena.
+
+    Uso:
+        - Exploración en el notebook (`persist=False`, por defecto): no escribe nada. Devuelve
+          los datos crudos y los enmascarados para comparar, contar el efecto de cada regla con
+          `mask_summary` y revisar series con `audit_series`. Al terminar la revisión, guardar
+          con `save_data_validation(result)`.
+        - Proceso automático (`persist=True`): ejecuta y guarda en `data/interim/` en un paso.
+        Las etapas siguientes solo leen `data/interim/`, así que alguna de las dos formas de
+        guardar debe correr antes de la etapa 3.
+
+    Cómo leer la salida:
+        - NaN en `units` o `prices_daily` significa "celda excluida", no cero; el motivo está en
+          `mask_reason` (códigos de `MASK_REASONS`). Un 0 en `units` es una venta real de cero.
+        - `rejections` tiene una fila por dato rechazado; `pre_launch` no aparece porque no es
+          un error, y `price_gap_no_sales` aparece solo como aviso.
+        - En `agg`, la fila k de cada arreglo es el artículo `item_ids[k]` y la columna j es el
+          día d = j + 1. Un día sin ninguna tienda válida queda NaN.
+
+    Memoria: con M5 completo, cada arreglo serie × día ocupa ~240 MB (float32); la salida
+    guarda cuatro (crudos y enmascarados) más `mask_reason` (~60 MB).
 
     Parámetros:
         cfg (dict): configuración validada.
+        persist (bool): si es True, guarda los intermedios con `save_data_validation`.
 
     Retorno:
-        dict: `rejections`, `launch`, `series_index` y el agregado `agg`.
+        dict con:
+            - `calendar` (pd.DataFrame): calendario validado.
+            - `week_of_day` (np.ndarray): `wm_yr_wk` de cada día 1..last_day.
+            - `prices_raw` (pd.DataFrame): precios semanales tal como se leyeron, con `csv_row`.
+            - `series_index` (pd.DataFrame): `store_id, item_id, csv_row` de cada fila de los
+              arreglos (ordenado por tienda y artículo; `csv_row` es la fila en el CSV).
+            - `units_raw`, `prices_daily_raw` (np.ndarray): unidades y precios diarios antes de
+              enmascarar.
+            - `units`, `prices_daily` (np.ndarray): los mismos arreglos enmascarados.
+            - `mask_reason` (np.ndarray int8): motivo de cada celda (0 = válida).
+            - `launch` (pd.DataFrame): `store_id, item_id, launch_wk, launch_d` por serie.
+            - `rejections` (pd.DataFrame): `reason, source, row_id, column, detail`.
+            - `agg` (dict): `item_ids`, `item_units`, `item_spend`, `item_launch_d` y
+              `chain_total` (salida de `aggregate_items`).
+            - `persisted` (list[Path]): archivos escritos; vacío si `persist=False`.
     """
     last_day = cfg["data"]["last_day"]
     calendar = load_calendar(cfg)
     validate_calendar(calendar, last_day)
     wod = week_of_day(calendar, last_day)
-    units, series_index = load_sales(cfg)
-    prices = load_prices(cfg)
-    prices_daily = build_daily_prices(prices, wod, series_index)
-    launch = compute_launch(prices_daily, series_index, wod)
-    masked_units, masked_prices, rejections = apply_masks(
-        units, prices_daily, launch, series_index, wod, prices, cfg["data"]["sales_file"]
+    units_raw, series_index = load_sales(cfg)
+    prices_raw = load_prices(cfg)
+    prices_daily_raw = build_daily_prices(prices_raw, wod, series_index)
+    launch = compute_launch(prices_daily_raw, series_index, wod)
+    units, prices_daily, rejections, mask_reason = apply_masks(
+        units_raw,
+        prices_daily_raw,
+        launch,
+        series_index,
+        wod,
+        prices_raw,
+        cfg["data"]["sales_file"],
     )
-    del units, prices_daily
-    agg = aggregate_items(masked_units, masked_prices, series_index, launch)
-    arrays, tables = interim_from_aggregate(agg)
-    arrays.update({"units": masked_units, "prices_daily": masked_prices, "week_of_day": wod})
-    tables.update({"series_index": series_index, "launch": launch, "rejections": rejections})
-    save_interim(arrays, tables)
-    return {"rejections": rejections, "launch": launch, "series_index": series_index, "agg": agg}
+    result = {
+        "calendar": calendar,
+        "week_of_day": wod,
+        "prices_raw": prices_raw,
+        "series_index": series_index,
+        "units_raw": units_raw,
+        "prices_daily_raw": prices_daily_raw,
+        "units": units,
+        "prices_daily": prices_daily,
+        "mask_reason": mask_reason,
+        "launch": launch,
+        "rejections": rejections,
+        "agg": aggregate_items(units, prices_daily, series_index, launch),
+    }
+    result["persisted"] = save_data_validation(result) if persist else []
+    return result
