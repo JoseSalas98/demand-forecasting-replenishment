@@ -1,5 +1,3 @@
-
-
 import numpy as np
 
 from src.metrics import naive_scale, rmse, rmsse, wape, wrmsse
