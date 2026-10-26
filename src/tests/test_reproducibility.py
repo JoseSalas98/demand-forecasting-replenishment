@@ -11,7 +11,7 @@ def _run(root, cfg, monkeypatch):
     root.mkdir(parents=True)
     monkeypatch.chdir(root)
     write_raw(root, cfg)
-    run_data_validation(cfg)
+    run_data_validation(cfg, persist=True)
     run_train_matrix(cfg)
     run_stability_stage(cfg)
     arts = load_manifest()["artifacts"]
