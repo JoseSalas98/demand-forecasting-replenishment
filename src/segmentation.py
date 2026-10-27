@@ -3,6 +3,8 @@ Los rangos de días son inclusivos y en base 1: la columna j de los arreglos es 
 """
 
 import warnings
+from itertools import combinations
+from math import ceil, comb
 
 import numpy as np
 import pandas as pd
@@ -374,3 +376,101 @@ def run_train_matrix(cfg: dict) -> dict:
     sensitivity = sensitivity_table(agg, start, max_day, seg)
     freeze(matrix, "matrix_train", "data/processed/matrix_train.parquet", cfg)
     return {"matrix": matrix, "sensitivity": sensitivity, "agg": agg}
+
+
+def find_cv_cuts(
+    cv,
+    spend,
+    n_cuts: int = 2,
+    min_share: float = 0.10,
+    resolution: int = 100,
+    labels: list[str] | None = None,
+) -> dict:
+    """Busca los cortes del CV que ordenan el gasto de mayor a menor entre segmentos.
+
+    Es una búsqueda de cambios de nivel como las de `ruptures`, pero sobre la distribución: los
+    artículos se ordenan por CV y el gasto en ese orden es la señal. El costo es el L2 del gasto
+    (suma de cuadrados dentro de cada segmento), pero no se minimiza sin más: solo compiten las
+    particiones que cumplen (1) cada segmento tiene al menos `min_share` de los artículos y
+    (2) el gasto medio por artículo baja estrictamente de un segmento al siguiente (el de CV
+    más bajo gasta más). Entre ellas gana la que minimiza el costo, es decir, la que más
+    separa los niveles de gasto. La búsqueda es exhaustiva sobre `resolution` posiciones de corte
+    candidatas repartidas en la distribución.
+
+    Parámetros:
+        cv (array-like): CV en porcentaje; los NaN se descartan.
+        spend (array-like): gasto de cada artículo, alineado con `cv`.
+        n_cuts (int): número de cortes; produce `n_cuts + 1` segmentos (por defecto 2: X, Y, Z).
+        min_share (float): fracción mínima de artículos por segmento.
+        resolution (int): número máximo de posiciones candidatas.
+        labels (list[str] | None): etiquetas de los segmentos; por defecto X, Y, Z con 2 cortes
+            y S1, S2, … en otro caso.
+
+    Retorno:
+        dict: `thresholds` (cortes de CV; con `classify_xyz` un artículo es del primer segmento si
+        CV < corte 1, y así sucesivamente), `segments` (una fila por segmento con artículos,
+        proporción, rango de CV y gasto), `n_feasible` y `n_evaluated`.
+    """
+    cv = np.asarray(cv, dtype=float)
+    spend = np.asarray(spend, dtype=float)
+    keep = ~np.isnan(cv)
+    order = np.argsort(cv[keep], kind="stable")
+    cv_s, spend_s = cv[keep][order], spend[keep][order]
+    n = len(cv_s)
+    k = n_cuts + 1
+    min_n = ceil(min_share * n)
+    if n_cuts < 1 or k * min_n > n:
+        raise ValueError(f"No caben {k} segmentos de al menos {min_share:.0%} de {n} artículos")
+    if labels is None:
+        labels = ["X", "Y", "Z"] if n_cuts == 2 else [f"S{i + 1}" for i in range(k)]
+    if len(labels) != k:
+        raise ValueError(f"Se esperaban {k} etiquetas y llegaron {len(labels)}")
+
+    # Posición p = corte antes del artículo p; no se corta entre CV iguales.
+    cands = np.flatnonzero(cv_s[1:] > cv_s[:-1]) + 1
+    cands = cands[(cands >= min_n) & (cands <= n - min_n)]
+    if len(cands) > resolution:
+        cands = cands[np.unique(np.linspace(0, len(cands) - 1, resolution).round().astype(int))]
+    n_evaluated = comb(len(cands), n_cuts)
+    if n_evaluated > 5_000_000:
+        raise ValueError(f"{n_evaluated} combinaciones: bajar `resolution` o `n_cuts`")
+    if n_evaluated == 0:
+        raise ValueError("No hay posiciones de corte que respeten el mínimo por segmento")
+
+    combos = np.array(list(combinations(cands, n_cuts)), dtype=np.int64).reshape(-1, n_cuts)
+    zeros = np.zeros(len(combos), dtype=np.int64)
+    bounds = np.column_stack([zeros, combos, np.full(len(combos), n)])
+    size = np.diff(bounds, axis=1)
+    cum = np.r_[0.0, np.cumsum(spend_s)]
+    mean = np.diff(cum[bounds], axis=1) / size
+    ok = (size >= min_n).all(axis=1) & (mean[:, :-1] > mean[:, 1:]).all(axis=1)
+    if not ok.any():
+        raise ValueError(
+            "Ninguna partición respeta el mínimo por segmento y un gasto medio descendente "
+            "con el CV"
+        )
+    # Minimizar el costo L2 dentro de los segmentos equivale a maximizar el de entre segmentos.
+    between = (size * (mean - spend_s.mean()) ** 2).sum(axis=1)
+    best = bounds[np.flatnonzero(ok)[np.argmax(between[ok])]]
+
+    thresholds = [float((cv_s[p - 1] + cv_s[p]) / 2) for p in best[1:-1]]
+    rows = []
+    for label, a, b in zip(labels, best[:-1], best[1:], strict=True):
+        rows.append(
+            {
+                "class": label,
+                "n_items": int(b - a),
+                "share_items": (b - a) / n,
+                "cv_min": float(cv_s[a]),
+                "cv_max": float(cv_s[b - 1]),
+                "mean_spend": float(spend_s[a:b].mean()),
+                "total_spend": float(spend_s[a:b].sum()),
+                "share_spend": float(spend_s[a:b].sum() / spend_s.sum()),
+            }
+        )
+    return {
+        "thresholds": thresholds,
+        "segments": pd.DataFrame(rows),
+        "n_feasible": int(ok.sum()),
+        "n_evaluated": n_evaluated,
+    }

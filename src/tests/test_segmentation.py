@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.segmentation import (
     build_matrix,
@@ -7,6 +8,7 @@ from src.segmentation import (
     classify_xyz,
     compute_cv,
     compute_usage_spend,
+    find_cv_cuts,
 )
 
 SEG = {
@@ -137,3 +139,53 @@ def test_sensitivity_table_counts():
     # Corte B en 90 %: c (90 % antes de sumarse) pasa a C.
     assert out[("abc_cut_B-5pp", "abc", "C")] == 2
     assert out[("base", "xyz", "X")] == 4
+
+
+def _cv_spend_three_levels(n=300):
+    cv = np.linspace(5, 100, n)
+    spend = np.where(cv < 30, 300.0, np.where(cv < 60, 200.0, 100.0))
+    return cv, spend
+
+
+def test_find_cv_cuts_recovers_monotone_levels():
+    cv, spend = _cv_spend_three_levels()
+    out = find_cv_cuts(cv, spend, n_cuts=2, min_share=0.10)
+    assert out["segments"]["class"].tolist() == ["X", "Y", "Z"]
+    assert out["segments"]["mean_spend"].is_monotonic_decreasing
+    np.testing.assert_allclose(out["thresholds"], [30, 60], atol=1.5)
+
+
+def test_find_cv_cuts_respects_min_share():
+    cv = np.linspace(5, 100, 200)
+    # El salto está en el 3 % inicial, por debajo del mínimo por segmento.
+    spend = np.where(cv < 8, 1000.0, 10.0) + np.linspace(1, 0, 200)
+    out = find_cv_cuts(cv, spend, n_cuts=2, min_share=0.10)
+    assert (out["segments"]["share_items"] >= 0.10).all()
+    assert out["segments"]["share_items"].sum() == pytest.approx(1.0)
+
+
+def test_find_cv_cuts_one_cut_and_custom_labels():
+    cv, spend = _cv_spend_three_levels()
+    out = find_cv_cuts(cv, spend, n_cuts=1, labels=["bajo", "alto"])
+    assert len(out["thresholds"]) == 1
+    assert out["segments"]["class"].tolist() == ["bajo", "alto"]
+
+
+def test_find_cv_cuts_ignores_nan_and_matches_classify_xyz():
+    cv, spend = _cv_spend_three_levels()
+    cv_nan = np.r_[cv, np.nan, np.nan]
+    out = find_cv_cuts(cv_nan, np.r_[spend, 1.0, 1.0])
+    classes = classify_xyz(pd.Series(cv), out["thresholds"])
+    counts = classes.value_counts().reindex(["X", "Y", "Z"]).tolist()
+    assert counts == out["segments"]["n_items"].tolist()
+
+
+def test_find_cv_cuts_fails_without_descending_partition():
+    cv = np.linspace(5, 100, 300)
+    with pytest.raises(ValueError, match="descendente"):
+        find_cv_cuts(cv, cv * 10, n_cuts=2)  # el gasto sube con el CV
+
+
+def test_find_cv_cuts_fails_when_segments_do_not_fit():
+    with pytest.raises(ValueError, match="No caben"):
+        find_cv_cuts(np.arange(10.0), np.arange(10.0)[::-1], n_cuts=2, min_share=0.5)
