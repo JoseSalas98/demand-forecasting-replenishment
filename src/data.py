@@ -549,6 +549,8 @@ def audit_series(
         {
             "d": np.arange(a, b + 1),
             "date": dates,
+            "store_id": store_id,
+            "item_id": item_id,
             "wm_yr_wk": result["week_of_day"][cols],
             "units_raw": result["units_raw"][i, cols],
             "price_raw": result["prices_daily_raw"][i, cols],
