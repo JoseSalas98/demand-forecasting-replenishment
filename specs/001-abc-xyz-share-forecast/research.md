@@ -82,9 +82,12 @@ comparar solo en train (FR-012).
 **Decisión**: cortes ABC en 80 / 95 % del gasto acumulado. Un artículo pertenece a una clase
 según su participación acumulada *antes* de sumar su propio gasto; los empates se resuelven por
 `item_id`. XYZ usa X < 10 %, 10 % ≤ Y < 25 %, Z ≥ 25 %. Son valores habituales en la práctica.
-FR-013 exige revisarlos antes de decidir: el notebook 02 muestra una tabla de sensibilidad solo
-en train (conteo de clases con ±5 pp), y los valores por defecto se congelan solo después de esa
-revisión.
+Son un punto de partida experimental, no valores fijos (FR-013). El método para elegir los
+definitivos no se fija de antemano; depende de la naturaleza de los datos y puede ser determinista
+(sensibilidad ±5 pp, percentiles) o algorítmico (por ejemplo, `find_cv_cuts`, que busca cortes del
+CV con gasto medio descendente y un mínimo de artículos por segmento). Reglas comunes: se ejecuta
+solo con train, el criterio se declara antes de ejecutarlo y los valores elegidos se congelan.
+Probar cortes en la exploración de cinco años es solo exploración y no decide nada.
 
 ## R6. Estabilidad, referencia y periodo de segmentación
 
