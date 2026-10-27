@@ -32,6 +32,11 @@ uno al gasto estimado? ¿Cuáles necesitan más promoción?
 - Q: ¿Cómo se evita que la réplica en el año 5 influya en la elección del modelo? → A: Los candidatos de pronóstico y `selection_level` se declaran antes de la réplica; cambiarlos después exige una nueva versión. La réplica no modifica la lista ni el tratamiento, y ninguna etapa de selección la lee.
 - Q: ¿Qué calcula la réplica en el año 5? → A: La matriz ABC × XYZ del año 5 con los cortes, umbrales y agregación del CV congelados; el acuerdo y el PSI del año 5 frente al promedio de los años 1 a 4 y frente a la matriz global de train; y, por producto objetivo, si mantiene su clase y su celda.
 
+### Session 2026-10-27
+
+- Q: ¿Los cortes ABC y los umbrales XYZ son valores fijos? → A: No. Los valores por defecto (80/95 % y 10/25 %) son un punto de partida experimental. El valor definitivo se elige solo con train y se congela (FR-020). El método para elegirlo no se fija en la spec: puede ser determinista o algorítmico, con el criterio declarado antes de ejecutarlo.
+- Q: ¿Puede la exploración de cinco años usar el año 5? → A: Sí, solo como línea base descriptiva para saber qué esperar al explorar por años (incluida la exploración inter e intraanual). Probar cortes en ella es exploración y no decide nada; los cortes que se congelan salen de train.
+
 ## Orden de ejecución
 
 Las historias están numeradas en el orden en que se ejecutan:
@@ -50,8 +55,8 @@ promoción y abastecimiento. Todos los artículos se analizan agregados sobre to
 ### User Story 1 - Exploración descriptiva de cinco años (Priority: P1)
 
 El analista describe primero los productos con los cinco años: ABC por gasto, XYZ,
-distribuciones, proporción de ceros, media frente a mediana, y estabilidad anual y global. Es solo
-descriptivo.
+distribuciones, proporción de ceros, media frente a mediana, y estabilidad anual y global, además de
+la exploración inter e intraanual. Usa el año 5 solo como línea base. Es solo descriptivo.
 
 **Why this priority**: es la primera etapa del análisis y da el contexto global antes de trabajar
 sobre la partición de train. No decide nada del modelo.
@@ -258,7 +263,8 @@ mismo conjunto y los mismos 13 orígenes.
   medio × unidades totales.
 - **FR-011**: El sistema DEBE ordenar los artículos de mayor a menor gasto, calcular gasto
   acumulado y porcentaje acumulado, y asignar A hasta el corte A (por defecto 80 %), B hasta el
-  corte B (por defecto 95 %) y C al resto.
+  corte B (por defecto 95 %) y C al resto. Los cortes por defecto son un punto de partida
+  experimental (ver FR-013).
 - **FR-012**: El sistema DEBE calcular el CV de cada artículo agregado como desviación estándar /
   media de sus unidades, en porcentaje, sobre la serie de unidades agregadas según el parámetro
   `cv_aggregation` (por defecto, bloques de 28 días alineados con el horizonte de pronóstico;
@@ -268,7 +274,9 @@ mismo conjunto y los mismos 13 orígenes.
   solo con train y el valor elegido queda congelado con la matriz.
 - **FR-013**: El sistema DEBE asignar X si CV < umbral X (por defecto 10 %), Y si umbral X ≤ CV <
   umbral Z (por defecto 25 %) y Z si CV ≥ umbral Z. Los valores por defecto son de práctica y
-  DEBEN verificarse antes de usarse para decidir.
+  son un punto de partida experimental: los definitivos (ABC y XYZ) se eligen solo con train, con
+  cualquier método determinista o algorítmico cuyo criterio se declare antes de ejecutarlo, y se
+  congelan con la matriz (FR-020). No se fija un método de antemano.
 - **FR-014**: El sistema DEBE entregar el ranking con gasto, porcentaje acumulado, CV, clase ABC,
   clase XYZ y celda ABC × XYZ de cada artículo, y serializarlo una vez.
 
@@ -331,7 +339,8 @@ mismo conjunto y los mismos 13 orígenes.
 **Exploración, réplica en el año 5 e informe**
 
 - **FR-029**: El sistema DEBE producir, como primera etapa del análisis y antes de la matriz sobre
-  train, una exploración descriptiva de cinco años que no alimente ninguna decisión. Sus
+  train, una exploración descriptiva de cinco años, incluido el año 5 como línea base, que no alimente
+  ninguna decisión; probar cortes en ella es solo exploración. Sus
   diferencias con la matriz de train congelada se reportan como hallazgo.
 - **FR-030**: Una vez congelados la lista objetivo y su tratamiento (FR-020), y declarados los
   candidatos de pronóstico y `selection_level` (FR-023, FR-024), y antes del backtesting, el
