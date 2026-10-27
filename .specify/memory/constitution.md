@@ -1,5 +1,34 @@
 <!--
 Sync Impact Report
+- Version change: 1.1.0 → 1.2.0 (MINOR, 2026-10-27)
+- Modified principles:
+  - III. Parámetros configurables: los cortes ABC y los umbrales XYZ son parámetros experimentales;
+    su valor por defecto es un punto de partida y el valor definitivo es el que se elige en train.
+  - VI. Método y congelamiento: la exploración de cinco años (que incluye el año 5) es solo una
+    línea base descriptiva, también inter e intraanual; y el método para elegir cortes no se fija de
+    antemano (determinista o algorítmico), pero siempre se ejecuta solo con train, con el criterio
+    declarado antes y con el resultado congelado.
+- Motivo: evitar que la experimentación con cortes y la exploración con el año 5 se lean como una
+  decisión sobre el test, sin atar el proyecto a una metodología que depende de la naturaleza de
+  los datos.
+- Impacto sobre artefactos congelados: ninguno (todavía no hay artefactos congelados).
+- Artefactos actualizados: spec.md (aclaraciones, FR-011, FR-013 y FR-029) y research.md (R5).
+
+Historial 1.1.0
+- Version change: 1.0.0 → 1.1.0 (MINOR, 2026-10-26)
+- Modified principles:
+  - VI. Método y congelamiento: el "Diagnóstico posterior (año 5)" pasa a ser la "Réplica en el
+    año 5", que se ejecuta antes del pronóstico, una vez congelada la lista objetivo y declarados
+    los candidatos de pronóstico y el nivel de selección. Sigue siendo solo diagnóstico.
+- Modified sections: Flujo de trabajo y cierre (se añade el orden obligatorio de etapas: la
+  exploración de cinco años va primero, y el pronóstico va después de la réplica en el año 5).
+- Motivo: el orden anterior ponía la exploración y la mirada al año 5 después del pronóstico, lo
+  que no corresponde al flujo de análisis del proyecto.
+- Impacto sobre artefactos congelados: ninguno (todavía no hay artefactos congelados).
+- Artefactos actualizados: spec.md, plan.md, research.md, data-model.md, contracts/,
+  quickstart.md y tasks.md de 001-abc-xyz-share-forecast.
+
+Historial previo
 - Version change: (plantilla sin ratificar) → 1.0.0
 - Modified principles: ninguno (primera adopción). Placeholders de plantilla reemplazados por:
   - [PRINCIPLE_1_NAME] → I. Propósito y alcance
@@ -69,6 +98,9 @@ en ABC y en el CV que alterarían la clasificación.
   periodo de uso, periodo de segmentación, candidatos, umbrales de estabilidad) DEBEN vivir en
   un único archivo de configuración. Cada parámetro DEBE tener un valor por defecto documentado.
   Ningún valor queda fijo en el código.
+- Los cortes ABC y los umbrales XYZ son parámetros experimentales: su valor por defecto es un punto
+  de partida, no una decisión. El valor definitivo es el que se elige en train y se congela
+  (Principio VI).
 - Cada cambio de parámetro DEBE quedar registrado con fecha, valor anterior, valor nuevo y
   motivo.
 - **Abstracciones:** una clase o función auxiliar se crea solo si cumple al menos una condición:
@@ -120,22 +152,31 @@ sin dejar rastro.
 
 - **Partición:** un único train (años 1 a 4) y un único test (año 5, 1 año), evaluado en 13
   orígenes cada 28 días, sin solapamiento.
-- **Exploración descriptiva:** puede usar los cinco años para describir los productos: ABC por
+- **Exploración descriptiva:** es la primera etapa del análisis, antes de la matriz sobre train.
+  Puede usar los cinco años, incluido el año 5, para describir los productos: ABC por
   gasto, XYZ, distribuciones, proporción de ceros, media frente a mediana, y estabilidad anual y
-  global solo como descripción. NO selecciona productos, cortes, periodos ni partición, y NO
-  informa ninguna decisión del modelo. Sus diferencias con la matriz de train se reportan como
+  global solo como descripción, además de la exploración inter e intraanual. Es una línea base
+  para saber qué esperar al explorar por años. NO selecciona productos, cortes, periodos ni
+  partición, y NO informa ninguna decisión del modelo; probar cortes aquí es solo exploración. Sus diferencias con la matriz de train se reportan como
   hallazgo y no corrigen la matriz congelada.
 - **Estabilidad estacional:** todo lo que influya en una decisión DEBE calcularse solo con train
   (años 1 a 4). Comparaciones: año 2 contra año 1; año 3 contra el promedio de años 1 y 2; año 4
   contra el promedio de años 1 a 3. El año 5 NO entra en ninguna comparación de este análisis.
 - El criterio para elegir entre periodos de segmentación candidatos DEBE declararse antes de
   ejecutar el análisis.
-- **Diagnóstico posterior (año 5):** una vez evaluado el test, la estabilidad del año 5 de los
-  productos objetivo congelados puede reportarse como diagnóstico. NO modifica la lista ni el
-  tratamiento.
+- **Réplica en el año 5:** una vez congelados la lista objetivo y su tratamiento, y declarados
+  los candidatos de pronóstico y el nivel de selección del modelo, se replica sobre el año 5 la
+  matriz ABC × XYZ y la estabilidad con los cortes, umbrales y agregación congelados. Es solo
+  diagnóstico: NO modifica la lista, el tratamiento ni los candidatos declarados, y ninguna etapa
+  de selección de modelos la lee. Cambiar un candidato declarado después de la réplica exige una
+  nueva versión.
 - Cualquier selección (línea base, órdenes ARIMA/SARIMA, periodo de segmentación, subconjunto,
   cortes ABC y XYZ, lista de productos objetivo) DEBE hacerse solo con backtesting o análisis
   interno dentro del train.
+- El método para elegir cortes ABC y XYZ no se fija de antemano: puede ser determinista (valores
+  fijos, sensibilidad, percentiles) o algorítmico (por ejemplo, una búsqueda de cortes sobre la
+  distribución del CV), según lo que muestren los datos. Cualquiera que se use DEBE ejecutarse solo
+  con train, con su criterio declarado antes de ejecutarlo, y sus valores finales se congelan.
 - Los candidatos de búsqueda DEBEN declararse antes de ejecutar la experimentación. Sus valores
   concretos se definen en esa fase.
 - Una vez seleccionados, todos los elementos quedan congelados. El test se evalúa una sola vez
@@ -173,6 +214,10 @@ MAPE no está definido o se distorsiona.
 
 - Un solo bloque de trabajo activo a la vez. Cada bloque se cierra cuando cumple su criterio
   verificable.
+- **Orden de etapas (obligatorio):** validación de datos → exploración descriptiva de cinco años
+  → matriz ABC × XYZ sobre train → estabilidad y lista objetivo (congeladas) → declaración de
+  candidatos de pronóstico → réplica en el año 5 → backtesting en train → evaluación única en
+  test → informe final.
 - El RMV se cierra cuando el ranking ABC × XYZ y el pronóstico de clase A cumplen los criterios
   de aceptación de la especificación.
 - Todo plan (`/speckit-plan`) DEBE pasar una verificación de cumplimiento contra los Principios
@@ -191,4 +236,4 @@ MAPE no está definido o se distorsiona.
   la centralización de parámetros, el registro de rechazos, el aislamiento del test y la
   justificación escrita de cada abstracción.
 
-**Version**: 1.0.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-10-24
+**Version**: 1.2.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-10-27
