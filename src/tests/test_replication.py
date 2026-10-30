@@ -28,9 +28,12 @@ def test_replication_declares_forecast_and_keeps_targets(staged):
     require_declared_before(forecast_keys(cfg), "matrix_y5")
     rep = out["year5_replication"]
     assert list(rep["item_id"]) == list(before["item_id"])
-    expected = rep["y5_cell"] == rep["frozen_cell"]
-    assert (rep["same_as_frozen"] == expected).all()
-    assert set(out["stability_y5"]["comparison"]) == {"Y5"}
+    y5_cell = out["matrix_y5"].set_index("item_id")["cell"].reindex(rep["item_id"])
+    assert (rep["same_as_frozen"].to_numpy() == (y5_cell == rep["frozen_cell"].to_numpy())).all()
+    st = out["stability_y5"]
+    assert set(st["target"]) == {"Y5"}
+    assert set(zip(st["base_kind"], st["base"])) == {("prev", "Y4"), ("y1", "Y1")}
+    assert set(st["level"]) == {"abc", "xyz", "cell"}
 
 
 def test_replication_uses_frozen_params_not_config(staged):
@@ -41,7 +44,7 @@ def test_replication_uses_frozen_params_not_config(staged):
     matrix_y5, _, _ = replicate_year5(
         load_frozen("targets"),
         seg_params,
-        load_frozen("matrix_train"),
+        load_frozen("zero_thresholds"),
         agg,
         cfg,
         agg["week_of_day"],
@@ -53,14 +56,14 @@ def test_replication_uses_frozen_params_not_config(staged):
     pd.testing.assert_series_equal(matrix_y5["abc_class"], expected["abc_class"])
 
 
-def test_year5_reference_uses_train_years(staged):
+def test_year5_reference_is_year4(staged):
     cfg = staged["cfg"]
     agg = load_interim(cfg, cfg["split"]["test_days"][1])
     seg_params = load_frozen("segmentation_params")
     _, _, rep = replicate_year5(
         load_frozen("targets"),
         seg_params,
-        load_frozen("matrix_train"),
+        load_frozen("zero_thresholds"),
         agg,
         cfg,
         agg["week_of_day"],
