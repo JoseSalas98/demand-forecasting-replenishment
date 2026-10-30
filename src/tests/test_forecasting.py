@@ -1,6 +1,7 @@
 import copy
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from src import forecasting
@@ -64,10 +65,44 @@ def test_candidate_grid_and_folds(tiny_cfg):
         "Y3": [850, 1213],
         "Y4": [1214, 1577],
     }
-    cfg["forecast"]["backtest_folds"] = 4
+    cfg["forecast"]["backtest_folds"] = 13
     starts = fold_starts(cfg)
-    assert starts == [1466, 1494, 1522, 1550]
-    assert starts[0] >= 1466 and starts[-1] + 27 == 1577
+    assert len(starts) == 13 and starts[0] == 1214 and starts[-1] + 27 == 1577
+    assert all(b - a == 28 for a, b in zip(starts, starts[1:]))
+
+
+def test_share_series_masks_leading_and_long_internal_runs():
+    units = np.array([[0, 0, 5, 1, 0, 0, 0, 0, 2, 0, 3, 0, 0]], dtype=float)
+    chain = np.full(13, 10.0)
+    thr = pd.Series({"a": 3})
+    shares, _ = share_series(units, chain, np.array(["a"]), 1, 13, thr)
+    x = shares[0]
+    assert np.isnan(x[:2]).all()  # arranque
+    assert np.isnan(x[4:8]).all()  # racha interna de 4 ≥ 3
+    assert x[9] == 0  # cero suelto
+    assert (x[11:] == 0).all()  # los ceros finales se conservan
+    # Enmascarado causal: con la historia hasta d_6 la racha aún es final y no se toca.
+    early, _ = share_series(units, chain, np.array(["a"]), 1, 6, thr)
+    assert (early[0, 4:6] == 0).all()
+
+
+def test_backtest_fits_once_before_first_fold(replicated, monkeypatch):
+    cfg = replicated["cfg"]
+    seen = []
+    original = forecasting.fit_candidate
+
+    def spy(series, candidate):
+        seen.append(len(series))
+        return original(series, candidate)
+
+    monkeypatch.setattr(forecasting, "fit_candidate", spy)
+    shares, agg, targets = _inputs(cfg)
+    thr = load_frozen("zero_thresholds").set_index("item_id")["threshold"]
+    run_backtest(shares, agg, targets, cfg, thr)
+    first = fold_starts(cfg)[0]
+    n_items = len(targets)
+    assert len(seen) == n_items * len(candidate_grid(cfg))
+    assert max(seen) <= first - 1  # solo días previos al primer fold
 
 
 @pytest.fixture
