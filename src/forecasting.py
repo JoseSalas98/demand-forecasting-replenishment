@@ -22,28 +22,45 @@ from src.freeze import (
     utc_now,
 )
 from src.metrics import naive_scale, rmse, rmsse, wape, wrmsse
+from src.segmentation import mask_zero_runs
 
 FAILURE_COLUMNS = ["item_id", "candidate_id", "stage", "message"]
 
+# Rachas que pasan a NaN en la serie de participación (FR-032). Los ceros finales no: en un origen
+# son lo último que se sabe del artículo y pueden ser una baja, no un faltante.
+SHARE_MASK_KINDS = ("leading", "internal")
+
 
 def share_series(
-    item_units: np.ndarray, chain_total: np.ndarray, item_ids, start_d: int, end_d: int
+    item_units: np.ndarray,
+    chain_total: np.ndarray,
+    item_ids,
+    start_d: int,
+    end_d: int,
+    zero_thresholds: pd.Series | None = None,
 ) -> tuple[np.ndarray, pd.DataFrame]:
     """Participación diaria = unidades del artículo / unidades totales reales de la cadena (FR-022).
 
     Los días con total de la cadena igual a 0 quedan NaN y se registran (`zero_chain_total`).
-    El prelanzamiento ya viene como NaN en `item_units`.
+    El prelanzamiento ya viene como NaN en `item_units`. Con `zero_thresholds`, las rachas de
+    ceros de arranque y las internas de largo ≥ umbral de [start_d, end_d] quedan NaN (FR-032);
+    las posiciones se miden dentro del rango, así que solo usa días ≤ `end_d`.
 
     Parámetros:
         item_units (np.ndarray): unidades por artículo y día.
         chain_total (np.ndarray): total de la cadena por día.
-        item_ids (array-like): identificadores (para el registro).
+        item_ids (array-like): identificadores (para el registro y el enmascarado).
         start_d (int): primer día.
         end_d (int): último día.
+        zero_thresholds (pd.Series | None): `item_id` → umbral congelado.
 
     Retorno:
         tuple[np.ndarray, pd.DataFrame]: participación (artículos × días del rango) y registro.
     """
+    if zero_thresholds is not None:
+        item_units = mask_zero_runs(
+            item_units, item_ids, zero_thresholds, start_d, end_d, SHARE_MASK_KINDS
+        )
     u = np.asarray(item_units[:, start_d - 1 : end_d], dtype=float)
     total = np.asarray(chain_total[start_d - 1 : end_d], dtype=float)
     zero = total <= 0
@@ -246,6 +263,8 @@ def forecast_frozen(history: np.ndarray, frozen: dict, h: int) -> np.ndarray:
 def fold_starts(cfg: dict) -> list[int]:
     """Días iniciales de los folds de backtest: bloques de `horizon` que terminan al final de train.
 
+    Con `backtest_folds = 13` y `horizon = 28` los folds cubren Y4 completo (d_1214–d_1577, R16).
+
     Parámetros:
         cfg (dict): configuración.
 
@@ -283,6 +302,24 @@ def _launch(agg: dict, k: int) -> int:
     return int(value) if np.isfinite(value) else 1
 
 
+def _history(
+    shares: np.ndarray, agg: dict, k: int, stop: int, zero_thresholds: pd.Series | None
+) -> np.ndarray:
+    """Participación del artículo k desde su lanzamiento hasta `stop` (inclusive).
+
+    Sin umbrales recorta `shares` (días desde d_1). Con umbrales recalcula la serie del artículo
+    enmascarando solo con los días ≤ `stop`, como se haría en ese origen.
+    """
+    launch = _launch(agg, k)
+    if zero_thresholds is None:
+        return shares[k, launch - 1 : stop]
+    row = np.asarray(agg["item_units"][k : k + 1], dtype=float)
+    s, _ = share_series(
+        row, agg["chain_total"], [agg["item_ids"][k]], 1, stop, zero_thresholds
+    )
+    return s[0, launch - 1 :]
+
+
 def _clip(share_hat: np.ndarray) -> np.ndarray:
     # Una participación negativa no tiene sentido como unidades (Principio II).
     """Recorta la participación pronosticada a valores mayores o iguales a cero."""
@@ -290,20 +327,27 @@ def _clip(share_hat: np.ndarray) -> np.ndarray:
 
 
 def run_backtest(
-    shares: np.ndarray, agg: dict, targets: pd.DataFrame, cfg: dict
+    shares: np.ndarray,
+    agg: dict,
+    targets: pd.DataFrame,
+    cfg: dict,
+    zero_thresholds: pd.Series | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Backtesting en train de todos los candidatos (FR-023, FR-024).
 
     Se detiene si `[forecast]` no se declaró antes de la réplica en el año 5 o si cambió desde
     entonces. Cada candidato se ajusta una vez con los datos previos al primer fold; los folds
-    siguientes solo añaden observaciones con parámetros fijos. El puntaje es el RMSSE por
-    artículo sobre unidades, promediado por unidad de selección.
+    siguientes solo añaden observaciones con parámetros fijos (R16: con 13 folds de 28 días el
+    ajuste usa los días ≤ d_1213 y los folds cubren Y4). El puntaje es el RMSSE por artículo
+    sobre unidades reales (sin enmascarar), promediado por unidad de selección. Con
+    `zero_thresholds`, cada historia se enmascara solo con los días previos a su origen.
 
     Parámetros:
         shares (np.ndarray): participación (artículos × días desde d_1 hasta fin de train).
         agg (dict): agregado de train.
         targets (pd.DataFrame): lista objetivo congelada.
         cfg (dict): configuración.
+        zero_thresholds (pd.Series | None): `item_id` → umbral de racha congelado.
 
     Retorno:
         tuple[pd.DataFrame, pd.DataFrame]: `backtest_scores` (`selection_unit, candidate_id,
@@ -331,7 +375,8 @@ def run_backtest(
                 (item, "*", "backtest_scale", "escala naive igual a 0; artículo omitido")
             )
             continue
-        fit_history = shares[k, launch - 1 : folds[0] - 1]
+        fit_history = _history(shares, agg, k, folds[0] - 1, zero_thresholds)
+        histories = [_history(shares, agg, k, start - 1, zero_thresholds) for start in folds]
         for cand in candidates:
             try:
                 frozen = fit_candidate(fit_history, cand)
@@ -340,7 +385,7 @@ def run_backtest(
                 continue
             for f, start in enumerate(folds, start=1):
                 try:
-                    share_hat = forecast_frozen(shares[k, launch - 1 : start - 1], frozen, h)
+                    share_hat = forecast_frozen(histories[f - 1], frozen, h)
                 except Exception as exc:  # noqa: BLE001
                     failures.append((item, cand["candidate_id"], f"backtest_fold_{f}", str(exc)))
                     continue
@@ -463,8 +508,11 @@ def run_backtesting_stage(cfg: dict) -> dict:
     assert_train_only(end, cfg)
     agg = load_interim(cfg, end)
     targets = load_frozen("targets")
-    shares, _ = share_series(agg["item_units"], agg["chain_total"], agg["item_ids"], 1, end)
-    scores, fail_bt = run_backtest(shares, agg, targets, cfg)
+    zero_thr = load_frozen("zero_thresholds").set_index("item_id")["threshold"]
+    shares, _ = share_series(
+        agg["item_units"], agg["chain_total"], agg["item_ids"], 1, end, zero_thr
+    )
+    scores, fail_bt = run_backtest(shares, agg, targets, cfg, zero_thr)
     models, fail_sel = select_and_freeze(scores, shares, agg, targets, cfg)
     baseline = baseline_models(shares, agg, targets, cfg)
     failures = pd.concat([fail_bt, fail_sel], ignore_index=True)
@@ -507,9 +555,7 @@ def evaluate_test(model_id: str, models_artifact: str, agg: dict, cfg: dict) -> 
     end = train_end(cfg)
     test_start = cfg["split"]["test_days"][0]
     h = cfg["split"]["horizon"]
-    shares, _ = share_series(
-        agg["item_units"], agg["chain_total"], agg["item_ids"], 1, agg["max_day"]
-    )
+    zero_thr = load_frozen("zero_thresholds").set_index("item_id")["threshold"]
     chain = np.asarray(agg["chain_total"], dtype=float)
     a, b = cfg["metrics"]["weight_window"]
     scales, weights = {}, {}
@@ -527,7 +573,8 @@ def evaluate_test(model_id: str, models_artifact: str, agg: dict, cfg: dict) -> 
         for m in models:
             item = m["item_ids"][0]
             k = index[item]
-            share_hat = _clip(forecast_frozen(shares[k, _launch(agg, k) - 1 : s - 1], m, h))
+            history = _history(None, agg, k, s - 1, zero_thr)
+            share_hat = _clip(forecast_frozen(history, m, h))
             units_hat = share_hat * chain[s - 1 : s - 1 + h]
             y = np.asarray(agg["item_units"][k, s - 1 : s - 1 + h], dtype=float)
             y_d[item], hat_d[item] = y, units_hat
