@@ -3,10 +3,16 @@ import pandas as pd
 import pytest
 
 from src.stability import (
+    STABILITY_COLUMNS,
+    STABILITY_DECLARATION_KEYS,
     STABILITY_RULES,
+    SEG_KEYS,
+    alternating_block_cv,
+    build_item_stability,
     build_targets,
-    choose_segment_period,
-    reference_classes,
+    comparison_plan,
+    noise_baseline,
+    paired_comparisons,
     segment_bounds,
     year_matrices,
 )
@@ -15,7 +21,12 @@ SEG = {
     "abc_cuts": [0.80, 0.95],
     "xyz_thresholds": [10.0, 25.0],
     "cv_aggregation": "block28",
-    "cv_min_blocks": 1,
+    "cv_min_blocks": 2,
+    "abc_rule_item_bounds": [[0.10, 0.20], [0.20, 0.30]],
+    "abc_rule_spend_bounds": [[0.60, 0.80], [0.20, 0.30]],
+    "abc_rule_step": 0.01,
+    "cv_cut_min_share": 0.20,
+    "cv_cut_resolution": 100,
 }
 
 
@@ -47,54 +58,95 @@ def test_rules_on_hand_built_inputs():
     assert STABILITY_RULES["a_every_year"](st).to_dict() == {"i1": True, "i2": False, "i3": True}
 
 
-def _agg_three_years():
-    days = 84
-    units = np.ones((4, days))
-    spend = np.ones((4, days))
-    spend[0] *= 10.0
-    spend[1] *= 3.0
-    spend[2, :] *= 6.0
-    units[2, :28] = np.nan  # Lanzado en Y2.
-    spend[2, :28] = np.nan
-    units[3, :56] = np.nan  # Lanzado en Y3: sin años previos activos.
-    spend[3, :56] = np.nan
-    return {
-        "item_ids": np.array(["a", "b", "c", "d"], dtype=object),
-        "item_units": units,
-        "item_spend": spend,
-        "item_launch_d": np.array([1, 1, 29, 57]),
-    }
+N_ITEMS = 40
+YEARS = {"Y1": (1, 56), "Y2": (57, 112), "Y3": (113, 168)}
 
 
-def test_reference_uses_only_active_prior_years():
-    agg = _agg_three_years()
-    years = {"Y1": (1, 28), "Y2": (29, 56), "Y3": (57, 84)}
-    ym = year_matrices(agg, years, SEG)
-    ref = reference_classes(ym, agg, SEG, "Y3", ["Y1", "Y2"], 28, years).set_index("item_id")
-    assert ref.loc["a", "n_ref_years"] == 2
-    assert ref.loc["a", "ref_spend_mean"] == 280.0
-    assert ref.loc["c", "n_ref_years"] == 1
-    assert ref.loc["c", "ref_spend_mean"] == 168.0
-    assert ref.loc["d", "n_ref_years"] == 0
-    assert pd.isna(ref.loc["d", "ref_abc"])
-    assert ref.loc["a", "ref_abc"] == "A"
+def _panel(swap_year: str | None = None, churn: bool = True):
+    """40 artículos, 3 años de 2 bloques: gasto ∝ 1/rango y CV creciente con el rango.
+
+    Con `swap_year`, los artículos 0 y 39 intercambian gasto en ese año. El artículo `late` se
+    lanza en Y2 y `gone` deja de tener datos en Y3.
+    """
+    days = 168
+    rank = np.arange(N_ITEMS)
+    level = 100.0 / (rank + 1)
+    amp = 0.02 + 0.6 * rank / N_ITEMS  # CV de 2 bloques = amp × 100
+    units = np.empty((N_ITEMS, days))
+    for d in range(days):
+        sign = 1 if (d // 28) % 2 == 0 else -1
+        units[:, d] = 10 * (1 + sign * amp)
+    spend = np.repeat(level[:, None], days, axis=1)
+    if swap_year is not None:
+        a, b = YEARS[swap_year]
+        spend[[0, -1], a - 1 : b] = spend[[-1, 0], a - 1 : b]
+    ids = np.array([f"i{k:02d}" for k in rank], dtype=object)
+    ids[5], ids[6] = "late", "gone"
+    if churn:
+        units[5, :56] = spend[5, :56] = np.nan
+        units[6, 112:] = spend[6, 112:] = np.nan
+    return {"item_ids": ids, "item_units": units, "item_spend": spend,
+            "item_launch_d": np.where(ids == "late", 57, 1).astype(float)}
 
 
-def test_choose_segment_period_ties_go_to_first():
-    ym = pd.DataFrame({"set_id": ["Y1", "Y1"], "item_id": ["a", "b"], "abc_class": ["A", "B"]})
-    same = pd.DataFrame(
-        {"set_id": ["Y1-P1", "Y1-P1"], "item_id": ["a", "b"], "abc_class": ["A", "B"]}
-    )
-    chosen, table = choose_segment_period(
-        ym, {"four_month": same, "quarter": same.copy()}, ["four_month", "quarter"]
-    )
-    assert chosen == "four_month"
-    assert set(table["kind"]) == {"four_month", "quarter"}
-    worse = same.assign(abc_class=["B", "B"])
-    chosen, _ = choose_segment_period(
-        ym, {"quarter": worse, "four_month": same}, ["quarter", "four_month"]
-    )
-    assert chosen == "four_month"
+def test_comparison_plan_prev_and_y1():
+    assert comparison_plan(["Y1", "Y2", "Y3"]) == [
+        ("prev", "Y1", "Y2"), ("y1", "Y1", "Y2"), ("prev", "Y2", "Y3"), ("y1", "Y1", "Y3"),
+    ]
+
+
+def test_paired_comparisons_use_same_items():
+    agg = _panel()
+    ym = year_matrices(agg, YEARS, SEG)
+    plan = comparison_plan(list(YEARS))
+    measures, results = paired_comparisons(ym, YEARS, plan, agg, SEG)
+    assert list(measures.columns) == STABILITY_COLUMNS
+    assert len(measures) == len(plan) * 3
+    items = results[("prev", "Y1", "Y2")]["items"].set_index("item_id")
+    assert items.loc["late", "status"] == "new"  # sin base: fuera de la comparación
+    later = results[("prev", "Y2", "Y3")]["items"].set_index("item_id")
+    assert later.loc["gone", "status"] == "no_target"
+    assert (measures.loc[measures["target"] == "Y2", "n"] <= N_ITEMS - 1).all()
+
+
+def test_paired_comparisons_without_changes_agree_fully():
+    agg = _panel(churn=False)
+    ym = year_matrices(agg, YEARS, SEG)
+    measures, _ = paired_comparisons(ym, YEARS, comparison_plan(list(YEARS)), agg, SEG)
+    assert (measures["kappa"] == 1).all() and (measures["keep_pct"] == 100).all()
+    assert (measures["max_shift_pp"] == 0).all() and measures["note"].isna().all()
+    assert (measures["n"] == N_ITEMS).all()
+
+
+def test_paired_comparisons_detect_swap_and_rule():
+    agg = _panel(swap_year="Y3")
+    ym = year_matrices(agg, YEARS, SEG)
+    plan = comparison_plan(list(YEARS))
+    measures, results = paired_comparisons(ym, YEARS, plan, agg, SEG)
+    abc = measures[(measures["level"] == "abc") & (measures["target"] == "Y3")]
+    assert (abc["kappa"] < 1).all()
+    prev = [k for k in plan if k[0] == "prev"]
+    st = build_item_stability(results, prev, {"stability": {"stability_rule": "abc_all"}})
+    stable = st.groupby("item_id")["stable"].first()
+    assert not stable["i00"] and not stable["i39"] and stable["i01"]
+    assert set(st["comparison"]) == {"Y1->Y2", "Y2->Y3"}
+    assert st.set_index(["item_id", "comparison"]).loc[("i00", "Y1->Y2"), "a_every_year"] == False  # noqa: E712
+
+
+def test_alternating_block_cv_and_noise_baseline():
+    agg = _panel()
+    units = np.repeat(np.array([[10.0] * 28 + [20.0] * 28 + [10.0] * 28 + [20.0] * 28]), 2, axis=0)
+    cv = alternating_block_cv(units, np.array(["a", "b"]), "Y", 1, 112, 2)
+    assert np.allclose(cv["cv"], 0.0)  # cada mitad ve bloques iguales
+    years = {"Y1": (1, 112)}
+    noise = noise_baseline(agg, agg["item_units"], years, SEG)
+    assert set(noise["base_kind"]) == {"noise"} and set(noise["level"]) == {"abc", "xyz", "cell"}
+    assert noise.loc[0, "base"] == "Y1-odd" and noise.loc[0, "target"] == "Y1-even"
+
+
+def test_no_period_or_psi_keys_in_stage_declarations():
+    keys = " ".join(STABILITY_DECLARATION_KEYS + SEG_KEYS)
+    assert "segment_" not in keys and "psi" not in keys and "agreement" not in keys
 
 
 def test_segment_bounds_cover_year():
