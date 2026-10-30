@@ -1,14 +1,30 @@
 """
-Justificación de las abstracciones (Principio III): `year_matrices`, `agreement_pct`, `psi` y
-`psi_band` se usan en el EDA, en la estabilidad de train y en la réplica (b).
+Justificación de las abstracciones (Principio III): `year_matrices`, `base_target_classes` y
+`transition_stats` se usan en el EDA, en la estabilidad de train y en la réplica (b). `psi` y
+`psi_band` quedan solo para la descripción del EDA (datos no pareados).
 """
 
 import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
+from sklearn.metrics import cohen_kappa_score
+from statsmodels.stats.contingency_tables import SquareTable
 
-from src.segmentation import build_matrix, classify_abc, classify_xyz
+from src.segmentation import (
+    abc_rule_kwargs,
+    build_matrix,
+    classify_abc_share,
+    classify_xyz,
+    cv_cut_kwargs,
+    find_cv_cuts,
+    mask_zero_runs,
+    select_abc_cuts,
+)
+
+# Valores del PSI para la descripción del EDA (nb 02, 8.1). No son parámetros de decisión.
+EDA_PSI = {"psi_epsilon": 1e-4, "psi_bands": [0.10, 0.25]}
 
 
 def year_matrices(
@@ -17,6 +33,7 @@ def year_matrices(
     seg: dict,
     week_of_day: np.ndarray | None = None,
     segment_bounds_by_year: dict[str, list[tuple[int, int]]] | None = None,
+    cv_units: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Construye una matriz ABC × XYZ por cada año recibido.
 
@@ -26,6 +43,7 @@ def year_matrices(
         seg (dict): parámetros de segmentación.
         week_of_day (np.ndarray | None): `wm_yr_wk` de cada día.
         segment_bounds_by_year (dict | None): segmentos por año (para `segment_period`).
+        cv_units (np.ndarray | None): unidades para el CV (rachas de ceros en NaN, FR-032).
 
     Retorno:
         pd.DataFrame: matrices concatenadas con `set_id` = nombre del año.
@@ -33,7 +51,7 @@ def year_matrices(
     frames = []
     for name, (start, end) in year_ranges.items():
         bounds = (segment_bounds_by_year or {}).get(name)
-        frames.append(build_matrix(name, agg, start, end, seg, week_of_day, bounds))
+        frames.append(build_matrix(name, agg, start, end, seg, week_of_day, bounds, cv_units))
     return pd.concat(frames, ignore_index=True)
 
 
@@ -112,7 +130,182 @@ def psi_band(value: float, bands: list[float]) -> str:
 
 ABC_LABELS = ["A", "B", "C"]
 XYZ_LABELS = ["X", "Y", "Z"]
+CELL_LABELS = [a + x for a in ABC_LABELS for x in XYZ_LABELS]
 SEGMENT_PREFIX = {"quarter": "Q", "four_month": "T"}
+
+
+def _fully_active(agg: dict, day_range: tuple[int, int]) -> np.ndarray:
+    """Artículos con dato en todos los días del rango."""
+    a, b = day_range
+    u = np.asarray(agg["item_units"][:, a - 1 : b], dtype=float)
+    return (~np.isnan(u)).sum(axis=1) == (b - a + 1)
+
+
+def _set_column(mats: pd.DataFrame, set_id: str, col: str, item_ids: np.ndarray) -> np.ndarray:
+    """Columna `col` de un conjunto, alineada con `item_ids` (NaN si el artículo no aparece)."""
+    sub = mats[mats["set_id"] == set_id].set_index("item_id").reindex(item_ids)
+    return sub[col].to_numpy(dtype=float)
+
+
+def _join_cell(abc: np.ndarray, xyz: np.ndarray) -> np.ndarray:
+    """Celda ABC × XYZ; None si falta alguna de las dos clases."""
+    out = np.full(len(abc), None, dtype=object)
+    ok = pd.notna(abc) & pd.notna(xyz)
+    out[ok] = abc[ok].astype(str) + xyz[ok].astype(str)
+    return out
+
+
+def base_target_classes(
+    mats: pd.DataFrame,
+    ranges: dict[str, tuple[int, int]],
+    base_ids: list[str],
+    target_id: str,
+    agg: dict,
+    abc_rule: dict,
+    psi_cfg: dict | None = None,
+    cv_cut_kw: dict | None = None,
+) -> dict:
+    """Selecciona los cortes en una base y clasifica con ellos la base y un conjunto objetivo.
+
+    Igual que train → test: los cortes se aprenden en la base y se aplican al objetivo.
+        - Base: promedio del gasto y del CV de cada artículo en los conjuntos de `base_ids` en
+          que estuvo activo todos los días (como FR-016).
+        - ABC: `select_abc_cuts` con `abc_rule` sobre el gasto de la base; el objetivo se
+          clasifica por participación con las fronteras de la base (`classify_abc_share`).
+        - XYZ (si `cv_cut_kw` no es None): `find_cv_cuts` sobre el CV de la base; los umbrales
+          se aplican al CV del objetivo, que debe tener la misma agregación.
+          Si `find_cv_cuts` no encuentra una partición válida, el XYZ queda vacío y el motivo va
+          en `summary["note"]` (Principio IV).
+        - PSI de los grupos homogéneos (solo si `psi_cfg` no es None, descripción del EDA): % de
+          artículos en cada celda ABC × XYZ de la base frente al objetivo, con los artículos que
+          tienen celda completa en los dos lados. Sin XYZ no hay PSI.
+    Justificación (Principio III, b): se usa en el análisis interanual y en el intraanual.
+
+    Parámetros:
+        mats (pd.DataFrame): matrices con `set_id`, `item_id`, `spend` y `cv` (p. ej. de
+            `year_matrices` o `period_matrices`); sus clases no se usan.
+        ranges (dict): `set_id` → (día inicial, día final), para medir la actividad.
+        base_ids (list[str]): conjuntos que forman la base.
+        target_id (str): conjunto objetivo.
+        agg (dict): agregado con `item_ids` e `item_units`.
+        abc_rule (dict): argumentos de `select_abc_cuts` (`item_bounds`, `spend_bounds`, `step`).
+        psi_cfg (dict | None): `psi_epsilon` y `psi_bands` (p. ej. `EDA_PSI`); None = sin PSI.
+        cv_cut_kw (dict | None): argumentos de `find_cv_cuts` (`n_cuts` = 2, `min_share`,
+            `resolution`).
+
+    Retorno:
+        dict con:
+            - `items` (pd.DataFrame): por artículo, `status` (`both`, `new` = sin base,
+              `no_target` = sin objetivo, `absent`), `ref_*` y `tgt_*` de gasto, CV, ABC, XYZ y
+              celda.
+            - `summary` (dict): cortes y fronteras usados, conteos, `psi` y `psi_band`.
+            - `proportions` (pd.DataFrame | None): `cell, base_pct, target_pct` de los artículos
+              comparados; None sin XYZ.
+            - `abc_scenarios` (pd.DataFrame): escenarios evaluados por `select_abc_cuts`.
+    """
+    if cv_cut_kw is not None and cv_cut_kw.get("n_cuts", 2) != 2:
+        raise ValueError("base_target_classes necesita n_cuts = 2 (clases X, Y y Z)")
+    item_ids = np.asarray(agg["item_ids"], dtype=object)
+    spend_cols, cv_cols = [], []
+    for set_id in base_ids:
+        active = _fully_active(agg, ranges[set_id])
+        spend_cols.append(np.where(active, _set_column(mats, set_id, "spend", item_ids), np.nan))
+        cv_cols.append(np.where(active, _set_column(mats, set_id, "cv", item_ids), np.nan))
+    spend = np.column_stack(spend_cols)
+    n_base_sets = (~np.isnan(spend)).sum(axis=1)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        ref_spend = np.nanmean(spend, axis=1)
+        ref_cv = np.nanmean(np.column_stack(cv_cols), axis=1)
+    in_base = n_base_sets > 0
+    in_target = _fully_active(agg, ranges[target_id])
+    tgt_spend = np.where(in_target, _set_column(mats, target_id, "spend", item_ids), np.nan)
+    tgt_cv = np.where(in_target, _set_column(mats, target_id, "cv", item_ids), np.nan)
+
+    rule = select_abc_cuts(item_ids[in_base], ref_spend[in_base], **abc_rule)
+    ref_abc = (
+        pd.Series(rule["abc"]["abc_class"].to_numpy(), index=rule["abc"]["item_id"].to_numpy())
+        .reindex(item_ids)
+        .to_numpy(dtype=object)
+    )
+    tgt_abc = classify_abc_share(tgt_spend, rule["share_bounds"])
+
+    none = np.full(len(item_ids), None, dtype=object)
+    ref_xyz, tgt_xyz, thresholds, note = none.copy(), none.copy(), [np.nan, np.nan], None
+    if cv_cut_kw is not None:
+        has_cv = in_base & ~np.isnan(ref_cv)
+        try:
+            thresholds = find_cv_cuts(ref_cv[has_cv], ref_spend[has_cv], **cv_cut_kw)[
+                "thresholds"
+            ]
+        except ValueError as exc:
+            note = f"sin XYZ: {exc}"
+        else:
+            ref_xyz = classify_xyz(pd.Series(np.where(in_base, ref_cv, np.nan)), thresholds)
+            ref_xyz = ref_xyz.to_numpy(dtype=object)
+            tgt_xyz = classify_xyz(pd.Series(tgt_cv), thresholds).to_numpy(dtype=object)
+    ref_cell = _join_cell(ref_abc, ref_xyz) if cv_cut_kw is not None else ref_abc
+    tgt_cell = _join_cell(tgt_abc, tgt_xyz) if cv_cut_kw is not None else tgt_abc
+
+    status = np.select(
+        [in_base & in_target, in_target, in_base], ["both", "new", "no_target"], "absent"
+    )
+    items = pd.DataFrame(
+        {
+            "item_id": item_ids,
+            "status": status,
+            "n_base_sets": n_base_sets,
+            "ref_spend_mean": ref_spend,
+            "ref_cv_mean": ref_cv,
+            "ref_abc": ref_abc,
+            "ref_xyz": ref_xyz,
+            "ref_cell": ref_cell,
+            "tgt_spend": tgt_spend,
+            "tgt_cv": tgt_cv,
+            "tgt_abc": tgt_abc,
+            "tgt_xyz": tgt_xyz,
+            "tgt_cell": tgt_cell,
+        }
+    )
+
+    value, proportions = np.nan, None
+    both = (status == "both") & pd.notna(ref_cell) & pd.notna(tgt_cell)
+    if cv_cut_kw is not None and note is None:
+        p_ref = class_proportions(pd.Series(ref_cell[both]), CELL_LABELS)
+        p_tgt = class_proportions(pd.Series(tgt_cell[both]), CELL_LABELS)
+        if psi_cfg is not None:
+            value = psi(p_ref, p_tgt, psi_cfg["psi_epsilon"])
+        proportions = pd.DataFrame(
+            {
+                "cell": CELL_LABELS,
+                "base_pct": [p_ref[c] * 100 for c in CELL_LABELS],
+                "target_pct": [p_tgt[c] * 100 for c in CELL_LABELS],
+            }
+        )
+    summary = {
+        "target": target_id,
+        "base": "+".join(base_ids),
+        "cut_A": rule["cuts"][0],
+        "cut_B": rule["cuts"][1],
+        "share_A": rule["share_bounds"][0],
+        "share_B": rule["share_bounds"][1],
+        "cv_X": thresholds[0],
+        "cv_Z": thresholds[1],
+        "n_base": int(in_base.sum()),
+        "n_target": int(in_target.sum()),
+        "n_compared": int(both.sum()),
+        "n_new": int((status == "new").sum()),
+        "n_no_target": int((status == "no_target").sum()),
+        "note": note,
+    }
+    if psi_cfg is not None:
+        summary.update({"psi": value, "psi_band": psi_band(value, psi_cfg["psi_bands"])})
+    return {
+        "items": items,
+        "summary": summary,
+        "proportions": proportions,
+        "abc_scenarios": rule["scenarios"],
+    }
 
 
 def segment_bounds(kind: str, start_d: int, end_d: int) -> list[tuple[int, int]]:
@@ -193,53 +386,200 @@ def period_matrices(
     return pd.concat(frames, ignore_index=True)
 
 
+def interleaved_halves(
+    agg: dict,
+    set_id: str,
+    start_d: int,
+    end_d: int,
+    week_of_day: np.ndarray | None = None,
+) -> pd.DataFrame:
+    """Gasto de cada artículo en las semanas impares y en las pares de un periodo.
+
+    Las dos mitades cubren la misma época y tienen casi el mismo largo, así que la diferencia de
+    clase entre ellas mide el ruido de la ventana, no la estacionalidad. Las semanas se numeran
+    por orden dentro del periodo (1.ª, 2.ª, …): impares = 1.ª, 3.ª, …
+    Justificación (Principio III, b): línea base de ruido del análisis intraanual del nb 02.
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_spend`.
+        set_id (str): conjunto del periodo (p. ej. `Y1-Q1`).
+        start_d (int): primer día del periodo.
+        end_d (int): último día del periodo.
+        week_of_day (np.ndarray | None): `wm_yr_wk` de cada día; si es None, bloques de 7 días
+            desde `start_d`.
+
+    Retorno:
+        pd.DataFrame: `set_id` (`{set_id}-odd` y `{set_id}-even`), `item_id`, `spend` y `cv`
+            (NaN: el CV de media ventana no se usa).
+    """
+    days = np.arange(start_d, end_d + 1)
+    if week_of_day is None:
+        week = (days - start_d) // 7
+    else:
+        week = np.unique(np.asarray(week_of_day)[days - 1], return_inverse=True)[1]
+    spend = np.asarray(agg["item_spend"][:, start_d - 1 : end_d], dtype=float)
+    frames = []
+    for name, mask in (("odd", week % 2 == 0), ("even", week % 2 == 1)):
+        frames.append(
+            pd.DataFrame(
+                {
+                    "set_id": f"{set_id}-{name}",
+                    "item_id": agg["item_ids"],
+                    "spend": np.nansum(spend[:, mask], axis=1),
+                    "cv": np.nan,
+                }
+            )
+        )
+    return pd.concat(frames, ignore_index=True)
+
+
+def period_pairs(year_names: list[str], n_periods: int, prefix: str) -> pd.DataFrame:
+    """Pares base → objetivo entre periodos del mismo largo.
+
+    - `adjacent`: cada periodo frente al siguiente (Yt-P4 → Yt+1-P1 cruza el año).
+    - `same_last_year`: el mismo periodo del año anterior frente al de este año.
+    Justificación (Principio III, b): comparaciones del análisis intraanual del nb 02.
+
+    Parámetros:
+        year_names (list[str]): años en orden (p. ej. Y1–Y5).
+        n_periods (int): periodos por año (4 trimestres o 3 cuatrimestres).
+        prefix (str): prefijo del periodo (`Q` o `T`, ver `SEGMENT_PREFIX`).
+
+    Retorno:
+        pd.DataFrame: `comparison`, `base_id` y `target_id`.
+    """
+    seq = [f"{y}-{prefix}{k}" for y in year_names for k in range(1, n_periods + 1)]
+    rows = [("adjacent", a, b) for a, b in zip(seq, seq[1:])]
+    rows += [("same_last_year", a, b) for a, b in zip(seq, seq[n_periods:])]
+    return pd.DataFrame(rows, columns=["comparison", "base_id", "target_id"])
+
+
+TRANSITION_LEVELS = {
+    "abc": (ABC_LABELS, ("ref_spend_mean", "tgt_spend")),
+    "xyz": (XYZ_LABELS, ("ref_cv_mean", "tgt_cv")),
+    "cell": (CELL_LABELS, None),
+}
+
+
+def _stuart_maxwell(counts: np.ndarray) -> tuple[float, int, float]:
+    """Prueba de Stuart–Maxwell (homogeneidad marginal pareada) sobre las clases presentes."""
+    present = (counts.sum(axis=0) + counts.sum(axis=1)) > 0
+    sub = counts[np.ix_(present, present)]
+    k = int(present.sum())
+    if k < 2:
+        return np.nan, 0, np.nan
+    if np.trace(sub) == sub.sum():  # nadie cambia: estadístico 0 (la covarianza es singular)
+        return 0.0, k - 1, 1.0
+    with warnings.catch_warnings():
+        # Con casi nadie cambiando la covarianza puede ser singular; statsmodels usa la pseudoinversa.
+        warnings.simplefilter("ignore")
+        res = SquareTable(sub, shift_zeros=False).homogeneity(method="stuart_maxwell")
+    return float(res.statistic), int(res.df), float(res.pvalue)
+
+
+def _move_shares(counts: np.ndarray, level: str) -> dict:
+    """% que mantiene, mejora, empeora o cambia en sentidos opuestos (solo `cell`).
+
+    Mejor = posición más baja en el orden de cada dimensión (A < B < C, X < Y < Z). En `cell`
+    cada artículo se compara en ABC y en XYZ por separado: mejora si sube en alguna sin bajar en
+    la otra, empeora si baja en alguna sin subir en la otra, y es mixto si sube en una y baja en
+    la otra (p. ej. AZ → BX).
+    """
+    i, j = np.indices(counts.shape)
+    k = len(XYZ_LABELS)
+    deltas = [j // k - i // k, j % k - i % k] if level == "cell" else [j - i]
+    better = np.all([d <= 0 for d in deltas], axis=0)
+    worse = np.all([d >= 0 for d in deltas], axis=0)
+    keep = better & worse
+    n = counts.sum()
+    return {
+        "keep_pct": counts[keep].sum() / n * 100,
+        "up_pct": counts[better & ~keep].sum() / n * 100,
+        "down_pct": counts[worse & ~keep].sum() / n * 100,
+        "mixed_pct": counts[~better & ~worse].sum() / n * 100 if level == "cell" else np.nan,
+    }
+
+
+def transition_stats(items: pd.DataFrame, level: str = "abc") -> dict:
+    """Medidas de cambio de clase entre la base y el objetivo de `base_target_classes`.
+
+    Usa los artículos con `status == "both"` y clase en los dos lados. `level` elige la clase:
+    `abc`, `xyz` o `cell` (ABC × XYZ).
+        - `keep_pct`, `up_pct`, `down_pct`: % que mantiene, mejora (C → A, Z → X) y empeora.
+          En `abc` y `xyz` son la diagonal, debajo y encima de la matriz de transición. En
+          `cell` el orden AX…CZ no es ordinal, así que se mira cada dimensión por separado
+          (`_move_shares`) y se agrega `mixed_pct`: sube en una dimensión y baja en la otra.
+        - `kappa`: kappa de Cohen sin ponderar (plano), acuerdo por artículo descontado el azar.
+        - `mobility`: índice de Shorrocks, (k − traza(P)) / (k − 1), con P normalizada por fila
+          y k las clases presentes en la base; 0 = nadie cambia.
+        - `spearman`: correlación de rangos del gasto (`abc`) o del CV (`xyz`) de la base y del
+          objetivo; NaN en `cell`.
+        - `stuart_maxwell`, `sm_df`, `sm_pvalue`: homogeneidad marginal pareada (¿cambia el % de
+          artículos por clase?), sobre las clases presentes.
+        - `max_shift_pp`, `max_shift_class`: mayor cambio del % de artículos de una clase, en
+          puntos porcentuales; da el tamaño del cambio que Stuart–Maxwell solo declara.
+    Justificación (Principio III, b): resume las comparaciones interanuales e intraanuales del
+    nb 02.
+
+    Parámetros:
+        items (pd.DataFrame): `items` de `base_target_classes`.
+        level (str): `abc`, `xyz` o `cell`.
+
+    Retorno:
+        dict con `n`, `keep_pct`, `up_pct`, `down_pct`, `mixed_pct` (NaN salvo en `cell`),
+        `kappa`, `mobility`, `spearman`, `stuart_maxwell`, `sm_df`, `sm_pvalue`,
+        `max_shift_pp` y `max_shift_class`.
+    """
+    labels, value_cols = TRANSITION_LEVELS[level]
+    ref, tgt = f"ref_{level}", f"tgt_{level}"
+    both = items[(items["status"] == "both") & items[ref].notna() & items[tgt].notna()]
+    counts = (
+        pd.crosstab(both[ref], both[tgt])
+        .reindex(index=labels, columns=labels, fill_value=0)
+        .to_numpy()
+    )
+    n = int(counts.sum())
+    out = {"n": n}
+    keys = [
+        "keep_pct", "up_pct", "down_pct", "mixed_pct", "kappa", "mobility", "spearman",
+        "stuart_maxwell", "sm_df", "sm_pvalue", "max_shift_pp", "max_shift_class",
+    ]
+    if n == 0:
+        return {**out, **dict.fromkeys(keys, np.nan)}
+    rows = counts.sum(axis=1)
+    present = rows > 0
+    p = counts[present] / rows[present, None]
+    k = int(present.sum())
+    trace = float(p[:, present].diagonal().sum()) if k else 0.0
+    shift = (counts.sum(axis=0) - rows) / n * 100
+    sm_stat, sm_df, sm_p = _stuart_maxwell(counts)
+    spearman = np.nan
+    if value_cols is not None:
+        spearman = float(spearmanr(both[value_cols[0]], both[value_cols[1]]).statistic)
+    out.update(
+        {
+            **_move_shares(counts, level),
+            "kappa": float(cohen_kappa_score(both[ref], both[tgt], labels=labels)),
+            "mobility": (k - trace) / (k - 1) if k > 1 else np.nan,
+            "spearman": spearman,
+            "stuart_maxwell": sm_stat,
+            "sm_df": sm_df,
+            "sm_pvalue": sm_p,
+            "max_shift_pp": float(np.abs(shift).max()),
+            "max_shift_class": labels[int(np.abs(shift).argmax())],
+        }
+    )
+    return out
+
+
 def _classes(mat: pd.DataFrame, set_id: str, col: str) -> pd.Series:
     """Devuelve la columna `col` de un conjunto indexada por artículo."""
     sub = mat[mat["set_id"] == set_id]
     return pd.Series(sub[col].to_numpy(), index=sub["item_id"].to_numpy())
 
 
-def choose_segment_period(
-    year_mats: pd.DataFrame, period_mats_by_kind: dict[str, pd.DataFrame], candidates: list[str]
-) -> tuple[str, pd.DataFrame]:
-    """Elige el periodo de segmentación con el criterio `max_mean_abc_agreement`.
-
-    Para cada candidato se mide el acuerdo ABC entre cada matriz por periodo y la matriz de su
-    año, y se promedia; gana el mayor y un empate va al primer candidato de la lista.
-
-    Parámetros:
-        year_mats (pd.DataFrame): matrices anuales.
-        period_mats_by_kind (dict[str, pd.DataFrame]): candidato → matrices por periodo.
-        candidates (list[str]): candidatos en el orden declarado.
-
-    Retorno:
-        tuple[str, pd.DataFrame]: periodo elegido y tabla `kind, set_id, agreement_pct`.
-    """
-    rows = []
-    for kind in candidates:
-        pm = period_mats_by_kind[kind]
-        for set_id in pm["set_id"].unique():
-            year = set_id.split("-")[0]
-            rows.append(
-                (
-                    kind,
-                    set_id,
-                    agreement_pct(
-                        _classes(pm, set_id, "abc_class"), _classes(year_mats, year, "abc_class")
-                    ),
-                )
-            )
-    table = pd.DataFrame(rows, columns=["kind", "set_id", "agreement_pct"])
-    means = table.groupby("kind", sort=False)["agreement_pct"].mean()
-    best = candidates[0]
-    for kind in candidates[1:]:
-        if means[kind] > means[best]:
-            best = kind
-    return best, table
-
-
 def prior_years_map(year_names: list[str]) -> dict[str, list[str]]:
-    """Comparaciones de train: cada año desde el segundo contra todos los anteriores.
+    """Cada año desde el segundo contra todos los anteriores (solo la usa el nb 02 original).
 
     Parámetros:
         year_names (list[str]): años en orden (p. ej. Y1–Y4).
@@ -250,148 +590,142 @@ def prior_years_map(year_names: list[str]) -> dict[str, list[str]]:
     return {year_names[k]: year_names[:k] for k in range(1, len(year_names))}
 
 
-def reference_classes(
-    year_mats: pd.DataFrame,
+def comparison_plan(year_names: list[str]) -> list[tuple[str, str, str]]:
+    """Comparaciones pareadas de la estabilidad: `(base_kind, base, target)` (FR-016, R14).
+
+    Cada año desde el segundo frente al año anterior (`prev`) y frente al primero (`y1`). Con el
+    segundo año las dos bases coinciden y se reportan las dos filas.
+
+    Parámetros:
+        year_names (list[str]): años en orden.
+
+    Retorno:
+        list[tuple[str, str, str]]: comparaciones en orden.
+    """
+    out = []
+    for k in range(1, len(year_names)):
+        out.append(("prev", year_names[k - 1], year_names[k]))
+        out.append(("y1", year_names[0], year_names[k]))
+    return out
+
+
+def alternating_block_cv(
+    units: np.ndarray, item_ids, set_id: str, start_d: int, end_d: int, min_blocks: int
+) -> pd.DataFrame:
+    """CV de bloques de 28 días alternos (impares y pares) de un periodo: ruido del CV.
+
+    Igual que `interleaved_halves` para el gasto: las dos mitades cubren la misma época, así que
+    su diferencia de clase XYZ mide el ruido de la estimación del CV. Un bloque con algún NaN se
+    descarta; CV = std poblacional / media × 100, NaN con media 0 o menos de `min_blocks` bloques.
+
+    Parámetros:
+        units (np.ndarray): unidades por artículo y día (con las rachas ya en NaN si aplica).
+        item_ids (array-like): identificadores alineados con las filas.
+        set_id (str): nombre del periodo (p. ej. `Y2`).
+        start_d (int): primer día.
+        end_d (int): último día.
+        min_blocks (int): mínimo de bloques completos por mitad.
+
+    Retorno:
+        pd.DataFrame: `set_id` (`{set_id}-odd`, `{set_id}-even`), `item_id` y `cv`.
+    """
+    u = np.asarray(units[:, start_d - 1 : end_d], dtype=float)
+    n_blocks = u.shape[1] // 28
+    sums = u[:, : n_blocks * 28].reshape(u.shape[0], n_blocks, 28).sum(axis=2)
+    frames = []
+    for name, cols in (("odd", slice(0, None, 2)), ("even", slice(1, None, 2))):
+        x = sums[:, cols]
+        n_ok = (~np.isnan(x)).sum(axis=1)
+        with warnings.catch_warnings(), np.errstate(invalid="ignore", divide="ignore"):
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean = np.nanmean(x, axis=1)
+            cv = np.nanstd(x, axis=1) / mean * 100
+        cv = np.where((n_ok >= min_blocks) & (mean > 0), cv, np.nan)
+        frames.append(pd.DataFrame({"set_id": f"{set_id}-{name}", "item_id": item_ids, "cv": cv}))
+    return pd.concat(frames, ignore_index=True)
+
+
+STABILITY_COLUMNS = [
+    "base_kind", "base", "target", "level", "n", "kappa", "stuart_maxwell", "sm_df",
+    "sm_pvalue", "max_shift_pp", "max_shift_class", "keep_pct", "up_pct", "down_pct",
+    "mixed_pct", "spearman", "note",
+]
+
+
+def _stat_rows(base_kind: str, res: dict) -> list[dict]:
+    """Filas de `stability.parquet` de una comparación: una por nivel (abc, xyz, cell)."""
+    s = res["summary"]
+    rows = []
+    for level in TRANSITION_LEVELS:
+        st = transition_stats(res["items"], level)
+        rows.append(
+            {"base_kind": base_kind, "base": s["base"], "target": s["target"], "level": level,
+             **st, "note": s.get("note")}
+        )
+    return rows
+
+
+def paired_comparisons(
+    mats: pd.DataFrame,
+    ranges: dict[str, tuple[int, int]],
+    plan: list[tuple[str, str, str]],
     agg: dict,
     seg: dict,
-    comparison: str,
-    prior_years: list[str],
-    min_active_days_year: int,
-    year_ranges: dict[str, tuple[int, int]],
-) -> pd.DataFrame:
-    """Clase de referencia de cada artículo frente al promedio de sus años previos activos (FR-016).
-
-    El gasto anual se promedia sobre los años previos en que el artículo está activo todo el año
-    (al menos `min_active_days_year` días con dato) y se vuelve a clasificar ABC sobre esos
-    promedios para todos los artículos con referencia; el CV anual se promedia y se clasifica XYZ.
-    Justificación (Principio III, b): se usa en las comparaciones de train y en la réplica Y5.
+) -> tuple[pd.DataFrame, dict]:
+    """Ejecuta un plan de comparaciones pareadas con los cortes elegidos en cada base (R14).
 
     Parámetros:
-        year_mats (pd.DataFrame): matrices anuales.
-        agg (dict): agregado (para medir los días activos).
-        seg (dict): parámetros de segmentación (cortes y umbrales).
-        comparison (str): año comparado (p. ej. `Y3` o `Y5`).
-        prior_years (list[str]): años previos.
-        min_active_days_year (int): días con dato para contar un año como activo.
-        year_ranges (dict): rangos de días de cada año.
+        mats (pd.DataFrame): matrices con `set_id`, `item_id`, `spend` y `cv`.
+        ranges (dict): `set_id` → (día inicial, día final).
+        plan (list): `(base_kind, base, target)`.
+        agg (dict): agregado.
+        seg (dict): `[segmentation]` (o lo congelado) con la regla ABC y `find_cv_cuts`.
 
     Retorno:
-        pd.DataFrame: `comparison, item_id, ref_spend_mean, ref_abc, ref_cv_mean, ref_xyz,
-        n_ref_years`.
+        tuple[pd.DataFrame, dict]: medidas (`STABILITY_COLUMNS`) y resultados de
+        `base_target_classes` por `(base_kind, base, target)`.
     """
-    item_ids = np.asarray(agg["item_ids"], dtype=object)
-    spend_cols, cv_cols = [], []
-    for year in prior_years:
-        a, b = year_ranges[year]
-        days_with_data = (~np.isnan(np.asarray(agg["item_units"][:, a - 1 : b], dtype=float))).sum(
-            axis=1
+    rows, results = [], {}
+    for base_kind, base, target in plan:
+        res = base_target_classes(
+            mats, ranges, [base], target, agg, abc_rule_kwargs(seg), None, cv_cut_kwargs(seg)
         )
-        active = days_with_data >= min_active_days_year
-        ym = year_mats[year_mats["set_id"] == year].set_index("item_id").reindex(item_ids)
-        spend_cols.append(np.where(active, ym["spend"].to_numpy(dtype=float), np.nan))
-        cv_cols.append(np.where(active, ym["cv"].to_numpy(dtype=float), np.nan))
-    spend = np.column_stack(spend_cols)
-    cv = np.column_stack(cv_cols)
-    n_ref = (~np.isnan(spend)).sum(axis=1)
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        spend_mean = np.nanmean(spend, axis=1)
-        cv_mean = np.nanmean(cv, axis=1)
-    out = pd.DataFrame(
-        {
-            "comparison": comparison,
-            "item_id": item_ids,
-            "ref_spend_mean": spend_mean,
-            "ref_cv_mean": cv_mean,
-            "n_ref_years": n_ref,
-        }
-    )
-    has_ref = out["n_ref_years"] > 0
-    abc = classify_abc(
-        out.loc[has_ref, "item_id"], out.loc[has_ref, "ref_spend_mean"].to_numpy(), seg["abc_cuts"]
-    )
-    out = out.merge(
-        abc[["item_id", "abc_class"]].rename(columns={"abc_class": "ref_abc"}),
-        on="item_id",
-        how="left",
-    )
-    out["ref_xyz"] = classify_xyz(out["ref_cv_mean"], seg["xyz_thresholds"]).to_numpy()
-    out.loc[~has_ref, "ref_xyz"] = None
-    return out[
-        [
-            "comparison",
-            "item_id",
-            "ref_spend_mean",
-            "ref_abc",
-            "ref_cv_mean",
-            "ref_xyz",
-            "n_ref_years",
-        ]
-    ]
+        results[(base_kind, base, target)] = res
+        rows += _stat_rows(base_kind, res)
+    return pd.DataFrame(rows, columns=STABILITY_COLUMNS), results
 
 
-def stability_measures(
-    year_mats: pd.DataFrame,
-    matrix_global: pd.DataFrame,
-    refs: pd.DataFrame,
-    comparisons: list[str],
-    prior_map: dict[str, list[str]],
-    cfg: dict,
+def noise_baseline(
+    agg: dict,
+    cv_units: np.ndarray,
+    year_ranges: dict[str, tuple[int, int]],
+    seg: dict,
+    week_of_day: np.ndarray | None = None,
 ) -> pd.DataFrame:
-    """Acuerdo y PSI de cada año comparado frente a su referencia y a la matriz global (FR-017).
+    """Línea base de ruido: semanas alternas (gasto) y bloques de 28 días alternos (CV) de cada año.
 
-    La distribución de referencia del PSI es el promedio simple de las proporciones de clase de
-    los años previos.
+    Las mitades impar y par de un año se comparan como base → objetivo con las mismas medidas
+    que las comparaciones entre años; lo que cambia entre ellas es ruido de la ventana.
 
     Parámetros:
-        year_mats (pd.DataFrame): matrices anuales.
-        matrix_global (pd.DataFrame): matriz global de train.
-        refs (pd.DataFrame): clases de referencia por comparación.
-        comparisons (list[str]): años comparados.
-        prior_map (dict): año comparado → años previos.
-        cfg (dict): configuración (`psi_epsilon`, `psi_bands`).
+        agg (dict): agregado.
+        cv_units (np.ndarray): unidades para el CV (rachas en NaN).
+        year_ranges (dict): años de train.
+        seg (dict): `[segmentation]`.
+        week_of_day (np.ndarray | None): `wm_yr_wk` de cada día.
 
     Retorno:
-        pd.DataFrame: `comparison, dimension, agreement_pct_vs_ref, agreement_pct_vs_global, psi,
-        psi_band`.
+        pd.DataFrame: filas con `base_kind = "noise"`.
     """
-    stab = cfg["stability"]
-    glob = matrix_global.set_index("item_id")
-    rows = []
-    for comp in comparisons:
-        ref = refs[refs["comparison"] == comp].set_index("item_id")
-        for dim, col, ref_col, labels in (
-            ("abc", "abc_class", "ref_abc", ABC_LABELS),
-            ("xyz", "xyz_class", "ref_xyz", XYZ_LABELS),
-        ):
-            cur = _classes(year_mats, comp, col)
-            p_cur = class_proportions(cur, labels)
-            priors = [
-                class_proportions(_classes(year_mats, y, col), labels) for y in prior_map[comp]
-            ]
-            p_ref = {k: float(np.mean([p[k] for p in priors])) for k in labels}
-            value = psi(p_ref, p_cur, stab["psi_epsilon"])
-            rows.append(
-                (
-                    comp,
-                    dim,
-                    agreement_pct(cur, ref[ref_col]),
-                    agreement_pct(cur, glob[col]),
-                    value,
-                    psi_band(value, stab["psi_bands"]),
-                )
-            )
-    return pd.DataFrame(
-        rows,
-        columns=[
-            "comparison",
-            "dimension",
-            "agreement_pct_vs_ref",
-            "agreement_pct_vs_global",
-            "psi",
-            "psi_band",
-        ],
-    )
+    frames, ranges, plan = [], {}, []
+    for name, (a, b) in year_ranges.items():
+        spend = interleaved_halves(agg, name, a, b, week_of_day).drop(columns="cv")
+        cv = alternating_block_cv(cv_units, agg["item_ids"], name, a, b, seg["cv_min_blocks"])
+        frames.append(spend.merge(cv, on=["set_id", "item_id"]))
+        ranges[f"{name}-odd"] = ranges[f"{name}-even"] = (a, b)
+        plan.append(("noise", f"{name}-odd", f"{name}-even"))
+    measures, _ = paired_comparisons(pd.concat(frames, ignore_index=True), ranges, plan, agg, seg)
+    return measures
 
 
 def _abc_all(st: pd.DataFrame) -> pd.Series:
@@ -428,55 +762,48 @@ STABILITY_RULES = {
 
 
 def build_item_stability(
-    year_mats: pd.DataFrame,
-    refs: pd.DataFrame,
-    comparisons: list[str],
-    train_year_names: list[str],
-    cfg: dict,
+    results: dict, comparisons: list[tuple[str, str, str]], cfg: dict
 ) -> pd.DataFrame:
-    """Compara la clase de cada artículo en cada año con su referencia y aplica la regla elegida.
+    """Compara la clase de cada artículo con su base y aplica la regla elegida (FR-018).
 
-    Una comparación sin referencia o sin clase cuenta como no coincidente.
+    Usa las comparaciones con base año anterior. Una comparación sin clase en algún lado cuenta
+    como no coincidente. `a_every_year`: A en la base de la primera comparación y en el objetivo
+    de todas.
 
     Parámetros:
-        year_mats (pd.DataFrame): matrices anuales.
-        refs (pd.DataFrame): referencias por comparación.
-        comparisons (list[str]): años comparados (Y2–Y4).
-        train_year_names (list[str]): años de train (para `a_every_year`).
+        results (dict): salida de `paired_comparisons` (por `(base_kind, base, target)`).
+        comparisons (list): comparaciones que entran en la regla (las de `prev`).
         cfg (dict): configuración (`stability.stability_rule`).
 
     Retorno:
         pd.DataFrame: `item_id, comparison, abc, ref_abc, xyz, ref_xyz, same_abc, same_xyz,
         same_cell, a_every_year, stable, rule`.
     """
-    items = pd.Index(sorted(year_mats["item_id"].unique()), name="item_id")
-    a_flags = pd.concat(
-        [_classes(year_mats, y, "abc_class").reindex(items).eq("A") for y in train_year_names],
-        axis=1,
-    ).all(axis=1)
     frames = []
-    for comp in comparisons:
-        cur = year_mats[year_mats["set_id"] == comp].set_index("item_id").reindex(items)
-        ref = refs[refs["comparison"] == comp].set_index("item_id").reindex(items)
-        same_abc = cur["abc_class"].notna() & (cur["abc_class"] == ref["ref_abc"])
-        same_xyz = cur["xyz_class"].notna() & (cur["xyz_class"] == ref["ref_xyz"])
+    for key in comparisons:
+        it = results[key]["items"]
+        same_abc = it["tgt_abc"].notna() & (it["tgt_abc"] == it["ref_abc"])
+        same_xyz = it["tgt_xyz"].notna() & (it["tgt_xyz"] == it["ref_xyz"])
         frames.append(
             pd.DataFrame(
                 {
-                    "item_id": items,
-                    "comparison": comp,
-                    "abc": cur["abc_class"].to_numpy(),
-                    "ref_abc": ref["ref_abc"].to_numpy(),
-                    "xyz": cur["xyz_class"].to_numpy(),
-                    "ref_xyz": ref["ref_xyz"].to_numpy(),
+                    "item_id": it["item_id"].to_numpy(),
+                    "comparison": f"{key[1]}->{key[2]}",
+                    "abc": it["tgt_abc"].to_numpy(),
+                    "ref_abc": it["ref_abc"].to_numpy(),
+                    "xyz": it["tgt_xyz"].to_numpy(),
+                    "ref_xyz": it["ref_xyz"].to_numpy(),
                     "same_abc": same_abc.to_numpy(),
                     "same_xyz": same_xyz.to_numpy(),
                     "same_cell": (same_abc & same_xyz).to_numpy(),
-                    "a_every_year": a_flags.reindex(items).to_numpy(),
                 }
             )
         )
     out = pd.concat(frames, ignore_index=True)
+    first = results[comparisons[0]]["items"].set_index("item_id")["ref_abc"].eq("A")
+    tgt_a = out.assign(a=out["abc"].eq("A")).groupby("item_id")["a"].all()
+    out["a_every_year"] = out["item_id"].map(first & tgt_a.reindex(first.index, fill_value=False))
+    out["a_every_year"] = out["a_every_year"].fillna(False).astype(bool)
     rule = cfg["stability"]["stability_rule"]
     stable = STABILITY_RULES[rule](out)
     out["stable"] = out["item_id"].map(stable).astype(bool)
@@ -523,24 +850,47 @@ def build_targets(matrix_train: pd.DataFrame, item_stab: pd.DataFrame, cfg: dict
 
 
 STABILITY_DECLARATION_KEYS = [
-    "stability.segment_candidates",
-    "stability.segment_criterion",
     "stability.stability_rule",
     "stability.stability_rule_criterion",
     "segmentation.cv_aggregation",
-    "segmentation.abc_cuts",
-    "segmentation.xyz_thresholds",
+    "segmentation.abc_rule_item_bounds",
+    "segmentation.abc_rule_spend_bounds",
+    "segmentation.abc_rule_step",
+    "segmentation.cv_cut_min_share",
+    "segmentation.cv_cut_resolution",
     "treatment_map",
 ]
 
-SEG_KEYS = ["abc_cuts", "xyz_thresholds", "cv_aggregation", "cv_min_blocks"]
+SEG_KEYS = [
+    "cv_aggregation",
+    "cv_min_blocks",
+    "abc_rule_item_bounds",
+    "abc_rule_spend_bounds",
+    "abc_rule_step",
+    "cv_cut_min_share",
+    "cv_cut_resolution",
+    "zero_alpha",
+    "long_run",
+]
+
+
+def _masked_units(agg: dict, zero_thresholds: pd.DataFrame, windows: list[tuple[int, int]]):
+    """Unidades con las rachas de ceros en NaN, ventana por ventana (umbrales congelados)."""
+    thr = zero_thresholds.set_index("item_id")["threshold"]
+    out = np.asarray(agg["item_units"], dtype=float)
+    for a, b in windows:
+        out = mask_zero_runs(out, agg["item_ids"], thr, a, b)
+    return out
 
 
 def run_stability_stage(cfg: dict) -> dict:
-    """Etapa 4: estabilidad Y2–Y4, periodo de segmentación, lista objetivo y congelamiento.
+    """Etapa 4: estabilidad pareada Y2–Y4, línea base de ruido, lista objetivo y congelamiento.
 
-    Registra las declaraciones antes de calcular, solo carga días de train y congela
-    `matrices_by_set`, `stability`, `item_stability`, `targets` y `segmentation_params`.
+    Registra las declaraciones antes de calcular y solo carga días de train. El CV usa las
+    unidades con las rachas de ceros en NaN según `zero_thresholds` (congelado en la etapa 3).
+    Cada año se compara con el anterior y con Y1, y la matriz global de train con cada año
+    (`base_kind = "global"`); la regla de estabilidad usa las comparaciones con el año anterior.
+    Congela `matrices_by_set`, `stability`, `item_stability`, `targets` y `segmentation_params`.
 
     Parámetros:
         cfg (dict): configuración validada.
@@ -559,55 +909,50 @@ def run_stability_stage(cfg: dict) -> dict:
     agg = load_interim(cfg, max_day)
     wod = agg["week_of_day"]
     matrix_train = load_frozen("matrix_train")
+    train_cuts = load_frozen("train_cuts")
+    zero_thr = load_frozen("zero_thresholds")
     years = train_years(cfg)
     seg = cfg["segmentation"]
-    stab = cfg["stability"]
+    start = min(a for a, _ in years.values())
+    masked = _masked_units(agg, zero_thr, [(start, max_day)])
 
-    candidates = stab["segment_candidates"]
-    period_mats = {k: period_matrices(agg, years, seg, k, wod) for k in candidates}
-    year_mats_abc = year_matrices(agg, years, _period_seg(seg), wod)
-    chosen, choice_table = choose_segment_period(year_mats_abc, period_mats, candidates)
-    bounds = (
-        segment_bounds_by_year(chosen, years)
-        if seg["cv_aggregation"] == "segment_period"
-        else None
+    year_seg = dict(
+        seg, abc_cuts=train_cuts["abc_cuts"], xyz_thresholds=train_cuts["xyz_thresholds"]
     )
-    year_mats = year_matrices(agg, years, seg, wod, bounds)
-
+    year_mats = year_matrices(agg, years, year_seg, wod, cv_units=masked)
     names = list(years)
-    prior = prior_years_map(names)
-    comparisons = list(prior)
-    refs = pd.concat(
-        [
-            reference_classes(
-                year_mats, agg, seg, c, prior[c], stab["min_active_days_year"], years
-            )
-            for c in comparisons
-        ],
-        ignore_index=True,
+    plan = comparison_plan(names)
+    measures, results = paired_comparisons(year_mats, years, plan, agg, seg)
+    glob = matrix_train.assign(set_id="train_global")
+    ranges = {**years, "train_global": (start, max_day)}
+    glob_plan = [("global", "train_global", n) for n in names]
+    glob_measures, _ = paired_comparisons(
+        pd.concat([year_mats, glob], ignore_index=True), ranges, glob_plan, agg, seg
     )
-    measures = stability_measures(year_mats, matrix_train, refs, comparisons, prior, cfg)
-    item_stab = build_item_stability(year_mats, refs, comparisons, names, cfg)
+    noise = noise_baseline(agg, masked, years, seg, wod)
+    measures = pd.concat([measures, glob_measures, noise], ignore_index=True)
+
+    prev = [k for k in plan if k[0] == "prev"]
+    item_stab = build_item_stability(results, prev, cfg)
     targets = build_targets(matrix_train, item_stab, cfg)
     seg_params = {k: seg[k] for k in SEG_KEYS}
     seg_params.update(
         {
-            "segment_period": chosen,
-            "stability_rule": stab["stability_rule"],
+            "abc_cuts": train_cuts["abc_cuts"],
+            "abc_share_bounds": train_cuts["abc_share_bounds"],
+            "xyz_thresholds": train_cuts["xyz_thresholds"],
+            "stability_rule": cfg["stability"]["stability_rule"],
             "treatment_map": dict(cfg["treatment_map"]),
         }
     )
-    matrices_by_set = pd.concat([year_mats, *period_mats.values()], ignore_index=True)
-    freeze(matrices_by_set, "matrices_by_set", "data/processed/matrices_by_set.parquet", cfg)
+    freeze(year_mats, "matrices_by_set", "data/processed/matrices_by_set.parquet", cfg)
     freeze(measures, "stability", "data/processed/stability.parquet", cfg)
     freeze(item_stab, "item_stability", "data/processed/item_stability.parquet", cfg)
     freeze(targets, "targets", "data/processed/targets.parquet", cfg)
     freeze(seg_params, "segmentation_params", "data/processed/segmentation_params.json", cfg)
     return {
-        "choice_table": choice_table,
-        "segment_period": chosen,
         "year_mats": year_mats,
-        "refs": refs,
+        "comparisons": results,
         "measures": measures,
         "item_stability": item_stab,
         "targets": targets,
@@ -618,22 +963,25 @@ def run_stability_stage(cfg: dict) -> dict:
 def replicate_year5(
     targets: pd.DataFrame,
     seg_params: dict,
-    matrix_train: pd.DataFrame,
+    zero_thresholds: pd.DataFrame,
     agg: dict,
     cfg: dict,
     week_of_day: np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Replica sobre el año 5 la matriz y la estabilidad con los parámetros congelados (FR-030).
+    """Replica sobre el año 5 la matriz y la estabilidad con lo congelado (FR-030).
 
-    Usa los cortes, umbrales, `cv_aggregation` y periodo de `segmentation_params`, nunca los de la
-    config. La referencia de Y5 es el promedio de los años activos Y1–Y4. Solo diagnóstico.
+    Usa la regla ABC, `find_cv_cuts`, `cv_aggregation`, los cortes y `zero_thresholds` congelados,
+    nunca los de la config. Las rachas se enmascaran en la ventana de train y en la de Y5 por
+    separado (en Y5 las posiciones de arranque y final se miden dentro de Y5). Bases: Y4 (año
+    anterior) y Y1, con las medidas pareadas de `transition_stats`. `matrix_y5` usa los cortes
+    congelados de train. Solo diagnóstico.
 
     Parámetros:
         targets (pd.DataFrame): lista objetivo congelada.
         seg_params (dict): parámetros de segmentación congelados.
-        matrix_train (pd.DataFrame): matriz global de train congelada.
+        zero_thresholds (pd.DataFrame): umbrales de racha congelados.
         agg (dict): agregado con los días del año 5.
-        cfg (dict): configuración (rangos de días, `psi_*`, `min_active_days_year`).
+        cfg (dict): configuración (rangos de días).
         week_of_day (np.ndarray | None): `wm_yr_wk` de cada día.
 
     Retorno:
@@ -641,47 +989,36 @@ def replicate_year5(
     """
     from src.config import all_years, train_years
 
-    seg = {k: seg_params[k] for k in SEG_KEYS}
     years = all_years(cfg)
     train_names = list(train_years(cfg))
     test_name = next(n for n in years if n not in train_names)
-    bounds = (
-        segment_bounds_by_year(seg_params["segment_period"], years)
-        if seg["cv_aggregation"] == "segment_period"
-        else None
+    start = years[train_names[0]][0]
+    masked = _masked_units(
+        agg, zero_thresholds, [(start, years[train_names[-1]][1]), years[test_name]]
     )
-    year_mats = year_matrices(agg, years, seg, week_of_day, bounds)
-    refs = reference_classes(
-        year_mats,
-        agg,
-        seg,
-        test_name,
-        train_names,
-        cfg["stability"]["min_active_days_year"],
-        years,
-    )
-    stability_y5 = stability_measures(
-        year_mats, matrix_train, refs, [test_name], {test_name: train_names}, cfg
-    )
+    year_mats = year_matrices(agg, years, seg_params, week_of_day, cv_units=masked)
+    plan = [("prev", train_names[-1], test_name), ("y1", train_names[0], test_name)]
+    stability_y5, results = paired_comparisons(year_mats, years, plan, agg, seg_params)
     matrix_y5 = year_mats[year_mats["set_id"] == test_name].reset_index(drop=True)
     y5 = matrix_y5.set_index("item_id")
-    ref = refs.set_index("item_id")
+    cmp = results[plan[0]]["items"].set_index("item_id")
     ids = targets["item_id"].to_numpy()
     rep = pd.DataFrame(
         {
             "item_id": ids,
             "frozen_cell": targets["cell"].to_numpy(),
-            "ref_abc": ref["ref_abc"].reindex(ids).to_numpy(),
-            "ref_xyz": ref["ref_xyz"].reindex(ids).to_numpy(),
-            "y5_abc": y5["abc_class"].reindex(ids).to_numpy(),
-            "y5_xyz": y5["xyz_class"].reindex(ids).to_numpy(),
-            "y5_cell": y5["cell"].reindex(ids).to_numpy(),
+            "ref_abc": cmp["ref_abc"].reindex(ids).to_numpy(),
+            "ref_xyz": cmp["ref_xyz"].reindex(ids).to_numpy(),
+            "y5_abc": cmp["tgt_abc"].reindex(ids).to_numpy(),
+            "y5_xyz": cmp["tgt_xyz"].reindex(ids).to_numpy(),
+            "y5_cell": cmp["tgt_cell"].reindex(ids).to_numpy(),
         }
     )
     rep["same_abc"] = rep["y5_abc"].notna() & (rep["y5_abc"] == rep["ref_abc"])
     rep["same_xyz"] = rep["y5_xyz"].notna() & (rep["y5_xyz"] == rep["ref_xyz"])
     rep["same_cell"] = rep["same_abc"] & rep["same_xyz"]
-    rep["same_as_frozen"] = rep["y5_cell"] == rep["frozen_cell"]
+    # Con los cortes congelados de train, no con los elegidos en Y4.
+    rep["same_as_frozen"] = y5["cell"].reindex(ids).to_numpy() == rep["frozen_cell"].to_numpy()
     return matrix_y5, stability_y5, rep
 
 
@@ -711,14 +1048,14 @@ def run_replication(cfg: dict) -> dict:
 
     targets = load_frozen("targets")
     seg_params = load_frozen("segmentation_params")
-    matrix_train = load_frozen("matrix_train")
+    zero_thr = load_frozen("zero_thresholds")
     targets_sha = load_manifest()["artifacts"]["targets"]["sha256"]
     keys = forecast_keys(cfg)
     record_declarations(keys, cfg)
     require_declarations(keys, utc_now(), cfg)
     agg = load_interim(cfg, cfg["split"]["test_days"][1])
     matrix_y5, stability_y5, rep = replicate_year5(
-        targets, seg_params, matrix_train, agg, cfg, agg["week_of_day"]
+        targets, seg_params, zero_thr, agg, cfg, agg["week_of_day"]
     )
     freeze(matrix_y5, "matrix_y5", "data/processed/matrix_y5.parquet", cfg)
     freeze(stability_y5, "stability_y5", "data/processed/stability_y5.parquet", cfg)
@@ -763,10 +1100,10 @@ def run_eda_five_years(cfg: dict) -> dict:
     start, end = years[names[0]][0], years[names[-1]][1]
     agg = load_interim(cfg, end)
     wod = agg["week_of_day"]
-    seg = _period_seg(cfg["segmentation"])
+    seg = cfg["segmentation"]
     matrix_5y = build_matrix(f"{names[0]}-{names[-1]}", agg, start, end, seg, wod)
     ym = year_matrices(agg, years, seg, wod)
-    stab = cfg["stability"]
+    stab = EDA_PSI
     rows = []
     for k, name in enumerate(names):
         for dim, col, labels in (
