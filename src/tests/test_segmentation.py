@@ -9,6 +9,9 @@ from src.segmentation import (
     compute_cv,
     compute_usage_spend,
     find_cv_cuts,
+    longest_run_threshold,
+    mask_zero_runs,
+    zero_run_thresholds,
 )
 
 SEG = {
@@ -189,3 +192,85 @@ def test_find_cv_cuts_fails_without_descending_partition():
 def test_find_cv_cuts_fails_when_segments_do_not_fit():
     with pytest.raises(ValueError, match="No caben"):
         find_cv_cuts(np.arange(10.0), np.arange(10.0)[::-1], n_cuts=2, min_share=0.5)
+
+
+def _longest_zero_run(x: np.ndarray) -> np.ndarray:
+    """Racha de ceros más larga de cada fila de una matriz booleana (True = cero)."""
+    best = np.zeros(x.shape[0], dtype=int)
+    cur = np.zeros(x.shape[0], dtype=int)
+    for col in x.T:
+        cur = np.where(col, cur + 1, 0)
+        best = np.maximum(best, cur)
+    return best
+
+
+@pytest.mark.parametrize("p0, n", [(0.2, 200), (0.5, 120), (0.05, 400)])
+def test_longest_run_threshold_matches_monte_carlo(p0, n):
+    alpha = 0.05
+    k = longest_run_threshold(p0, n, alpha)
+    sims = _longest_zero_run(np.random.default_rng(0).random((20_000, n)) < p0)
+    assert (sims >= k).mean() <= alpha + 0.01
+    assert (sims >= k - 1).mean() > alpha - 0.01
+
+
+def test_longest_run_threshold_low_p0_and_undefined_cases():
+    assert longest_run_threshold(0.01, 1450, 0.01) == 3
+    assert longest_run_threshold(0.0, 100, 0.01) is None
+    assert longest_run_threshold(1.0, 100, 0.01) is None
+    assert longest_run_threshold(0.9, 5, 0.01) is None  # ningún k ≤ n cumple
+
+
+def _zero_agg():
+    units = np.array(
+        [
+            [np.nan, np.nan, 0, 0, 3, 1, 0, 2, 0, 0, 0, 0, 0, 4, 1, 0, 0],
+            [5, 0, 1] * 5 + [0, 0],
+            [np.nan] * 17,
+            [0] * 17,
+        ],
+        dtype=float,
+    )
+    return {"item_ids": np.array(["a", "b", "c", "d"]), "item_units": units}
+
+
+def test_zero_run_thresholds_fallbacks_and_reasons():
+    out = zero_run_thresholds(_zero_agg(), 1, 17, 0.01, 7).set_index("item_id")
+    assert out.loc["a", "n_days"] == 11  # de la primera venta (d_5) a la última (d_15)
+    assert out.loc["a", "p0"] == pytest.approx(6 / 11)
+    assert out.loc["c", "reason"] == "no_sales" and out.loc["d", "reason"] == "no_sales"
+    assert (out.loc[["c", "d"], "threshold"] == 7).all()
+    assert (out.loc[["c", "d"], "source"] == "fallback").all()
+    no_zero = {"item_ids": np.array(["e"]), "item_units": np.ones((1, 20))}
+    row = zero_run_thresholds(no_zero, 1, 20, 0.01, 7).iloc[0]
+    assert row["reason"] == "no_zeros" and row["threshold"] == 7
+
+
+def test_mask_zero_runs_internal_and_edges():
+    agg = _zero_agg()
+    thr = pd.Series({"a": 3, "b": 3})
+    out = mask_zero_runs(agg["item_units"], agg["item_ids"], thr, 1, 17)
+    a = out[0]
+    assert np.isnan(a[:4]).all()  # prelanzamiento (ya NaN) y arranque d_3–d_4
+    assert a[6] == 0  # cero suelto interno: se conserva
+    assert np.isnan(a[8:13]).all()  # racha interna de 5 ≥ 3
+    assert np.isnan(a[15:]).all()  # ceros finales
+    assert np.array_equal(out[1][:15], agg["item_units"][1][:15])  # ceros sueltos de b
+    only_internal = mask_zero_runs(
+        agg["item_units"], agg["item_ids"], thr, 1, 17, kinds=("leading", "internal")
+    )
+    assert (only_internal[0, 15:] == 0).all()
+    assert np.isnan(only_internal[0, 8:13]).all()
+    untouched = mask_zero_runs(agg["item_units"], agg["item_ids"], pd.Series({"a": 6}), 1, 17)
+    assert (untouched[0, 8:13] == 0).all()  # 5 < 6
+
+
+def test_run_train_matrix_declares_before_freezing(staged):
+    from src.freeze import load_manifest
+    from src.segmentation import TRAIN_DECLARATION_KEYS
+
+    manifest = load_manifest()
+    declared = {d["key"]: d["declared_at"] for d in manifest["declarations"]}
+    assert set(TRAIN_DECLARATION_KEYS) <= set(declared)
+    frozen_at = manifest["artifacts"]["zero_thresholds"]["frozen_at"]
+    assert all(declared[k] < frozen_at for k in TRAIN_DECLARATION_KEYS)
+    assert {"zero_thresholds", "train_cuts", "matrix_train"} <= set(manifest["artifacts"])

@@ -2,12 +2,16 @@
 Los rangos de días son inclusivos y en base 1: la columna j de los arreglos es el día j + 1.
 """
 
-import warnings
 from itertools import combinations
 from math import ceil, comb
+import warnings
 
 import numpy as np
 import pandas as pd
+from scipy.signal import lfilter, lfiltic
+from scipy.stats import chi2, rankdata
+from statsmodels.sandbox.stats.runs import runstest_1samp
+from statsmodels.tsa.seasonal import STL
 
 MATRIX_COLUMNS = [
     "set_id",
@@ -101,6 +105,23 @@ def _block_sums(u: np.ndarray, bounds: list[tuple[int, int]]) -> np.ndarray:
     return np.column_stack(cols)
 
 
+def _weekly_bounds(week_of_day: np.ndarray, start_d: int, end_d: int) -> list[tuple[int, int]]:
+    """Semanas `wm_yr_wk` completas (7 días) dentro de [start_d, end_d], en posiciones relativas.
+
+    Justificación (Principio III, b): la usan `compute_cv` (`weekly`) y `seasonal_strength_items`.
+    """
+    wk = np.asarray(week_of_day)[start_d - 1 : end_d]
+    starts = np.flatnonzero(np.r_[True, wk[1:] != wk[:-1]])
+    ends = np.r_[starts[1:], len(wk)]
+    full_weeks = np.asarray(week_of_day)
+    bounds = []
+    for a, b in zip(starts, ends):
+        week_total = int((full_weeks == wk[a]).sum())
+        if b - a == 7 and week_total == 7:
+            bounds.append((int(a), int(b)))
+    return bounds
+
+
 def compute_cv(
     item_units: np.ndarray,
     start_d: int,
@@ -141,15 +162,7 @@ def compute_cv(
     elif aggregation == "weekly":
         if week_of_day is None:
             raise ValueError("cv_aggregation='weekly' requiere week_of_day")
-        wk = np.asarray(week_of_day)[start_d - 1 : end_d]
-        starts = np.flatnonzero(np.r_[True, wk[1:] != wk[:-1]])
-        ends = np.r_[starts[1:], n_days]
-        full_weeks = np.asarray(week_of_day)
-        bounds = []
-        for a, b in zip(starts, ends):
-            week_total = int((full_weeks == wk[a]).sum())
-            if b - a == 7 and week_total == 7:
-                bounds.append((int(a), int(b)))
+        bounds = _weekly_bounds(week_of_day, start_d, end_d)
     elif aggregation == "segment_period":
         if not segment_bounds:
             raise ValueError("cv_aggregation='segment_period' requiere segment_bounds")
@@ -201,6 +214,7 @@ def build_matrix(
     seg: dict,
     week_of_day: np.ndarray | None = None,
     segment_bounds: list[tuple[int, int]] | None = None,
+    cv_units: np.ndarray | None = None,
 ) -> pd.DataFrame:
     """Construye la matriz ABC × XYZ de un conjunto de cálculo (FR-014).
 
@@ -216,6 +230,9 @@ def build_matrix(
         seg (dict): `abc_cuts`, `xyz_thresholds`, `cv_aggregation`, `cv_min_blocks`.
         week_of_day (np.ndarray | None): `wm_yr_wk` de cada día.
         segment_bounds (list[tuple[int, int]] | None): segmentos para `segment_period`.
+        cv_units (np.ndarray | None): unidades para el CV, p. ej. con las rachas de ceros en NaN
+            (`mask_zero_runs`, FR-032); si es None, `agg["item_units"]`. El uso, el gasto y la
+            actividad salen siempre de `agg`.
 
     Retorno:
         pd.DataFrame: columnas `MATRIX_COLUMNS`, ordenadas por gasto (inactivos al final).
@@ -223,7 +240,7 @@ def build_matrix(
     item_ids = np.asarray(agg["item_ids"], dtype=object)
     us = compute_usage_spend(agg["item_units"], agg["item_spend"], start_d, end_d)
     cv = compute_cv(
-        agg["item_units"],
+        agg["item_units"] if cv_units is None else cv_units,
         start_d,
         end_d,
         seg["cv_aggregation"],
@@ -345,37 +362,101 @@ def sensitivity_table(
     return pd.DataFrame(rows, columns=["variant", "dimension", "class", "count"])
 
 
-def run_train_matrix(cfg: dict) -> dict:
-    """Etapa 3: matriz ABC × XYZ global de train, tabla de sensibilidad y congelamiento.
+TRAIN_DECLARATION_KEYS = [
+    "segmentation.cv_aggregation",
+    "segmentation.cv_min_blocks",
+    "segmentation.abc_rule_item_bounds",
+    "segmentation.abc_rule_spend_bounds",
+    "segmentation.abc_rule_step",
+    "segmentation.cv_cut_min_share",
+    "segmentation.cv_cut_resolution",
+    "segmentation.zero_alpha",
+    "segmentation.long_run",
+]
 
-    Solo carga días ≤ fin de train. La agregación `segment_period` no aplica a la matriz global
-    porque el periodo se elige en la etapa 4.
+
+def abc_rule_kwargs(seg: dict) -> dict:
+    """Argumentos de `select_abc_cuts` tomados de `[segmentation]` (o de lo congelado)."""
+    return {
+        "item_bounds": [tuple(b) for b in seg["abc_rule_item_bounds"]],
+        "spend_bounds": [tuple(b) for b in seg["abc_rule_spend_bounds"]],
+        "step": seg["abc_rule_step"],
+    }
+
+
+def cv_cut_kwargs(seg: dict) -> dict:
+    """Argumentos de `find_cv_cuts` tomados de `[segmentation]` (o de lo congelado)."""
+    return {"n_cuts": 2, "min_share": seg["cv_cut_min_share"], "resolution": seg["cv_cut_resolution"]}
+
+
+def run_train_matrix(cfg: dict) -> dict:
+    """Etapa 3: umbrales de ceros, cortes de train, matriz ABC × XYZ global y congelamiento.
+
+    Orden: registra las declaraciones (`TRAIN_DECLARATION_KEYS`), carga solo días ≤ fin de train,
+    estima los umbrales de racha (FR-032) y enmascara las rachas para el CV, elige los cortes ABC
+    con `select_abc_cuts` y los umbrales XYZ con `find_cv_cuts` (FR-013), y congela
+    `zero_thresholds`, `train_cuts` y `matrix_train`. `abc_cuts` y `xyz_thresholds` de la config
+    solo se usan en la tabla de sensibilidad.
 
     Parámetros:
         cfg (dict): configuración validada.
 
     Retorno:
-        dict: `matrix`, `sensitivity` y `agg`.
+        dict: `matrix`, `sensitivity`, `zero_thresholds`, `cuts`, `abc_scenarios`, `cv_segments`,
+        `cv_raw` (CV sin enmascarar, para comparar) y `agg`.
     """
     from src.config import train_end, train_years
     from src.data import assert_train_only, load_interim
-    from src.freeze import freeze
+    from src.freeze import freeze, record_declarations, require_declarations, utc_now
 
     seg = cfg["segmentation"]
-    if seg["cv_aggregation"] == "segment_period":
-        raise ValueError(
-            "cv_aggregation='segment_period' no aplica a la matriz global de train: el periodo "
-            "se elige en la etapa 4. Usar block28, daily o weekly."
-        )
+    record_declarations(TRAIN_DECLARATION_KEYS, cfg)
+    require_declarations(TRAIN_DECLARATION_KEYS, utc_now(), cfg)
     max_day = train_end(cfg)
     assert_train_only(max_day, cfg)
     agg = load_interim(cfg, max_day)
     years = train_years(cfg)
     start = min(a for a, _ in years.values())
-    matrix = build_matrix("train_global", agg, start, max_day, seg, agg["week_of_day"])
+    wod = agg["week_of_day"]
+
+    thresholds = zero_run_thresholds(agg, start, max_day, seg["zero_alpha"], seg["long_run"])
+    masked = mask_zero_runs(
+        agg["item_units"], agg["item_ids"], thresholds.set_index("item_id")["threshold"],
+        start, max_day,
+    )
+    us = compute_usage_spend(agg["item_units"], agg["item_spend"], start, max_day)
+    ids = np.asarray(agg["item_ids"], dtype=object)
+    active = us["active"].to_numpy()
+    rule = select_abc_cuts(ids[active], us.loc[active, "spend"].to_numpy(), **abc_rule_kwargs(seg))
+    cv = compute_cv(masked, start, max_day, seg["cv_aggregation"], seg["cv_min_blocks"], wod)
+    cv_raw = compute_cv(
+        agg["item_units"], start, max_day, seg["cv_aggregation"], seg["cv_min_blocks"], wod
+    )
+    has_cv = active & cv["cv"].notna().to_numpy()
+    cv_res = find_cv_cuts(
+        cv["cv"].to_numpy()[has_cv], us["spend"].to_numpy()[has_cv], **cv_cut_kwargs(seg)
+    )
+    chosen = dict(seg, abc_cuts=rule["cuts"], xyz_thresholds=cv_res["thresholds"])
+    matrix = build_matrix("train_global", agg, start, max_day, chosen, wod, cv_units=masked)
     sensitivity = sensitivity_table(agg, start, max_day, seg)
+    cuts = {
+        "abc_cuts": rule["cuts"],
+        "abc_share_bounds": rule["share_bounds"],
+        "xyz_thresholds": cv_res["thresholds"],
+    }
+    freeze(thresholds, "zero_thresholds", "data/processed/zero_thresholds.parquet", cfg)
+    freeze(cuts, "train_cuts", "data/processed/train_cuts.json", cfg)
     freeze(matrix, "matrix_train", "data/processed/matrix_train.parquet", cfg)
-    return {"matrix": matrix, "sensitivity": sensitivity, "agg": agg}
+    return {
+        "matrix": matrix,
+        "sensitivity": sensitivity,
+        "zero_thresholds": thresholds,
+        "cuts": cuts,
+        "abc_scenarios": rule["scenarios"],
+        "cv_segments": cv_res["segments"],
+        "cv_raw": pd.Series(cv_raw["cv"].to_numpy(), index=ids),
+        "agg": agg,
+    }
 
 
 def find_cv_cuts(
@@ -474,3 +555,648 @@ def find_cv_cuts(
         "n_feasible": int(ok.sum()),
         "n_evaluated": n_evaluated,
     }
+
+
+def _outside(values: np.ndarray, bounds: tuple[float, float]) -> np.ndarray:
+    """Puntos porcentuales que `values` (en %) queda fuera del intervalo `bounds` (fracciones)."""
+    lo, hi = bounds[0] * 100, bounds[1] * 100
+    return np.maximum(lo - values, 0) + np.maximum(values - hi, 0)
+
+
+def _center_distance(values: np.ndarray, bounds: tuple[float, float]) -> np.ndarray:
+    """Distancia en puntos porcentuales de `values` (en %) al centro del intervalo `bounds`."""
+    return np.abs(values - (bounds[0] + bounds[1]) * 50)
+
+
+def select_abc_cuts(
+    item_ids,
+    spend,
+    item_bounds: tuple[tuple[float, float], tuple[float, float]] = ((0.10, 0.20), (0.20, 0.30)),
+    spend_bounds: tuple[tuple[float, float], tuple[float, float]] = ((0.60, 0.80), (0.20, 0.30)),
+    step: float = 0.01,
+) -> dict:
+    """Elige los cortes ABC que mejor cumplen una regla de % de artículos y % de gasto.
+
+    Recorre una grilla de pares (`cut_A` < `cut_B`, paso `step`) y calcula, con la convención de
+    `classify_abc`, el % de artículos y el % de gasto de A y de B. La violación es la suma de los
+    puntos porcentuales que esos cuatro valores quedan fuera de sus intervalos. Gana el par de
+    menor violación; entre empates, el más cercano al centro de los intervalos, y después el de
+    cortes más bajos. Se minimiza la violación en lugar de exigir 0 porque la curva de Pareto ata
+    el % de artículos al % de gasto y la regla puede no tener solución exacta.
+    Justificación (Principio III, b): se usa en la matriz global del EDA, en cada base del
+    análisis interanual y en cada año del intraanual.
+
+    Parámetros:
+        item_ids (array-like): identificadores de los artículos.
+        spend (array-like): gasto de cada artículo.
+        item_bounds (tuple): intervalos de % de artículos de A y de B, como fracciones.
+        spend_bounds (tuple): intervalos de % de gasto de A y de B, como fracciones.
+        step (float): paso de la grilla de cortes.
+
+    Retorno:
+        dict: `cuts` ([cut_A, cut_B]); `share_bounds` (fronteras de participación en el gasto de
+        A y de B, a mitad de camino entre el último artículo de la clase y el primero de la
+        siguiente; ver `classify_abc_share`); `abc` (salida de `classify_abc` con los cortes
+        elegidos) y `scenarios` (una fila por par, ordenada de mejor a peor).
+    """
+    ids = np.asarray(item_ids, dtype=object)
+    spend = np.asarray(spend, dtype=float)
+    # Cortes 1.0 dejan todo en A: solo interesa el orden y el % acumulado antes de cada artículo.
+    ranked = classify_abc(ids, spend, [1.0, 1.0])
+    total = ranked["spend"].sum()
+    if len(ranked) == 0 or total <= 0:
+        raise ValueError("select_abc_cuts necesita artículos con gasto positivo")
+    before = ranked["cum_pct_before"].to_numpy()
+    cum = np.r_[0.0, np.cumsum(ranked["spend"].to_numpy())] / total
+    n = len(ranked)
+
+    grid = np.round(np.arange(1, round(1 / step)) * step, 10)
+    ia, ib = np.triu_indices(len(grid), k=1)
+    cut_a, cut_b = grid[ia], grid[ib]
+    # Con `cum_pct_before` no decreciente, los A son los primeros `n_a` artículos.
+    n_a = np.searchsorted(before, cut_a, side="left")
+    n_b = np.searchsorted(before, cut_b, side="left")
+    sc = pd.DataFrame(
+        {
+            "cut_A": cut_a,
+            "cut_B": cut_b,
+            "A_items_pct": n_a / n * 100,
+            "A_spend_pct": cum[n_a] * 100,
+            "B_items_pct": (n_b - n_a) / n * 100,
+            "B_spend_pct": (cum[n_b] - cum[n_a]) * 100,
+            "C_items_pct": (n - n_b) / n * 100,
+            "C_spend_pct": (1 - cum[n_b]) * 100,
+        }
+    )
+    checks = (
+        ("A_items_pct", item_bounds[0]),
+        ("A_spend_pct", spend_bounds[0]),
+        ("B_items_pct", item_bounds[1]),
+        ("B_spend_pct", spend_bounds[1]),
+    )
+    sc["violation"] = sum(_outside(sc[col].to_numpy(), b) for col, b in checks).round(9)
+    sc["center_distance"] = sum(_center_distance(sc[col].to_numpy(), b) for col, b in checks)
+    sc = sc.sort_values(
+        ["violation", "center_distance", "cut_A", "cut_B"], kind="stable"
+    ).reset_index(drop=True)
+    cuts = [float(sc.loc[0, "cut_A"]), float(sc.loc[0, "cut_B"])]
+
+    abc = classify_abc(ids, spend, cuts)
+    share = abc["spend"].to_numpy() / total
+    share_bounds = []
+    for upper, lower in (("A", ("B", "C")), ("B", ("C",))):
+        in_cls = abc["abc_class"].to_numpy() == upper
+        below = np.isin(abc["abc_class"].to_numpy(), lower)
+        if not in_cls.any():
+            share_bounds.append(share_bounds[-1] if share_bounds else float(share.max()))
+            continue
+        low = share[in_cls].min()
+        share_bounds.append(float((low + share[below].max()) / 2) if below.any() else float(low))
+    return {"cuts": cuts, "share_bounds": share_bounds, "abc": abc, "scenarios": sc}
+
+
+def classify_abc_share(spend, share_bounds: list[float]) -> np.ndarray:
+    """Clasifica ABC por participación en el gasto con fronteras fijas, tomadas de una base.
+
+    A si la participación es ≥ `share_bounds[0]`, B si es ≥ `share_bounds[1]` y C en otro caso.
+    A diferencia de `classify_abc`, la proporción de clases puede cambiar entre conjuntos, y usar
+    la participación en lugar del gasto absoluto neutraliza el crecimiento de la cadena.
+    Justificación (Principio III, b): se usa en el análisis interanual y en el intraanual.
+
+    Parámetros:
+        spend (array-like): gasto de cada artículo (NaN = sin clase).
+        share_bounds (list[float]): fronteras de participación de A y de B.
+
+    Retorno:
+        np.ndarray: "A", "B", "C" o None por artículo.
+    """
+    spend = np.asarray(spend, dtype=float)
+    valid = ~np.isnan(spend)
+    total = spend[valid].sum()
+    out = np.full(len(spend), None, dtype=object)
+    if total <= 0:
+        return out
+    share = spend[valid] / total
+    out[valid] = np.select([share >= share_bounds[0], share >= share_bounds[1]], ["A", "B"], "C")
+    return out
+
+
+ZERO_RUN_COLUMNS = ["item_id", "position", "start_d", "end_d", "length"]
+
+
+def zero_runs(agg: dict, start_d: int, end_d: int) -> pd.DataFrame:
+    """Rachas de días con cero de cada artículo en un rango, con su posición.
+
+    Los días NaN (sin dato) se saltan: la racha se mide en días activos y un NaN en medio no la
+    corta, porque un día sin dato no es evidencia de venta. Posición: `leading` (antes de la
+    primera venta del rango), `trailing` (después de la última) o `internal`. Un artículo sin
+    ninguna venta en el rango tiene una sola racha `leading`.
+    Justificación (Principio III, b): la usan `zero_breakdown`, `drop_zero_runs` y el histograma
+    de rachas del EDA.
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_units`.
+        start_d (int): primer día.
+        end_d (int): último día.
+
+    Retorno:
+        pd.DataFrame: `item_id, position, start_d, end_d, length`; `start_d` y `end_d` son el
+        primer y el último día con cero de la racha.
+    """
+    u = _window(agg["item_units"], start_d, end_d)
+    ids = np.asarray(agg["item_ids"], dtype=object)
+    rows = []
+    for i in range(u.shape[0]):
+        days = np.flatnonzero(~np.isnan(u[i]))
+        if not len(days):
+            continue
+        zero = u[i, days] == 0
+        if not zero.any():
+            continue
+        edges = np.diff(np.r_[0, zero.astype(np.int8), 0])
+        starts, ends = np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)
+        sales = np.flatnonzero(~zero)
+        first, last = (sales[0], sales[-1]) if len(sales) else (len(zero), -1)
+        for s, e in zip(starts, ends):
+            position = "leading" if s < first else "trailing" if s > last else "internal"
+            rows.append(
+                (ids[i], position, start_d + int(days[s]), start_d + int(days[e - 1]), int(e - s))
+            )
+    return pd.DataFrame(rows, columns=ZERO_RUN_COLUMNS)
+
+
+def _run_kind(runs: pd.DataFrame, long_run: int) -> pd.Series:
+    """Tipo de cada racha: `leading`, `trailing`, `long_run` (interna ≥ `long_run`) o `short`."""
+    internal = np.where(runs["length"] >= long_run, "long_run", "short")
+    return pd.Series(
+        np.where(runs["position"] == "internal", internal, runs["position"]), index=runs.index
+    )
+
+
+def zero_breakdown(
+    agg: dict,
+    start_d: int,
+    end_d: int,
+    long_run: int,
+    active_stores: np.ndarray | None = None,
+    runs: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Descompone los días con cero de cada artículo según su origen probable.
+
+    - `leading`: ceros entre el primer día activo y la primera venta. El prelanzamiento ya es NaN,
+      así que esto es el arranque: precio publicado sin ventas todavía.
+    - `trailing`: ceros después de la última venta (el artículo dejó de venderse).
+    - `long_run`: rachas internas de al menos `long_run` días (episodio de escasez o de falta de
+      surtido).
+    - `short`: ceros internos sueltos o en rachas cortas (demanda intermitente).
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_units`.
+        start_d (int): primer día.
+        end_d (int): último día.
+        long_run (int): longitud mínima, en días activos, de una racha larga.
+        active_stores (np.ndarray | None): tiendas con dato por artículo y día (salida de
+            `active_stores_by_item`), alineado con `agg["item_ids"]`.
+        runs (pd.DataFrame | None): salida de `zero_runs` ya calculada para el mismo rango.
+
+    Retorno:
+        pd.DataFrame: `item_id, active_days, zero_days, leading, trailing, long_run, short,
+        n_long_runs, max_internal_run` y, si se pasa `active_stores`, `mean_active_stores`.
+    """
+    ids = np.asarray(agg["item_ids"], dtype=object)
+    u = _window(agg["item_units"], start_d, end_d)
+    active = ~np.isnan(u)
+    if runs is None:
+        runs = zero_runs(agg, start_d, end_d)
+    runs = runs.assign(kind=_run_kind(runs, long_run))
+    kinds = ["leading", "trailing", "long_run", "short"]
+    by_kind = (
+        runs.groupby(["item_id", "kind"])["length"].sum().unstack(fill_value=0)
+        if len(runs)
+        else pd.DataFrame(columns=kinds, dtype=int)
+    )
+    by_kind = by_kind.reindex(columns=kinds, fill_value=0)
+    internal = runs[runs["position"] == "internal"].groupby("item_id")["length"]
+    out = pd.DataFrame(
+        {
+            "item_id": ids,
+            "active_days": active.sum(axis=1),
+            "zero_days": (u == 0).sum(axis=1),
+        }
+    )
+    out = out.join(by_kind.reindex(ids, fill_value=0).reset_index(drop=True))
+    long_counts = runs[runs["kind"] == "long_run"].groupby("item_id").size()
+    out["n_long_runs"] = long_counts.reindex(ids, fill_value=0).to_numpy()
+    out["max_internal_run"] = internal.max().reindex(ids, fill_value=0).to_numpy()
+    if active_stores is not None:
+        stores = _window(active_stores, start_d, end_d)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            out["mean_active_stores"] = np.nanmean(np.where(active, stores, np.nan), axis=1)
+    return out
+
+
+def drop_zero_runs(
+    item_units: np.ndarray, item_ids, runs: pd.DataFrame, kinds: set[str], long_run: int
+) -> np.ndarray:
+    """Copia de las unidades con los días de ciertas rachas de ceros puestos en NaN.
+
+    Sirve para medir cuánto del CV viene de esas rachas: con `block28`, `compute_cv` descarta
+    entero el bloque que contiene un día NaN.
+
+    Parámetros:
+        item_units (np.ndarray): unidades por artículo y día.
+        item_ids (array-like): identificadores alineados con las filas de `item_units`.
+        runs (pd.DataFrame): salida de `zero_runs`.
+        kinds (set[str]): tipos a quitar (`leading`, `trailing`, `long_run`, `short`).
+        long_run (int): longitud mínima de una racha larga.
+
+    Retorno:
+        np.ndarray: unidades float64 con esas rachas en NaN.
+    """
+    out = np.array(item_units, dtype=np.float64)
+    sel = runs[_run_kind(runs, long_run).isin(kinds)]
+    rows = pd.Index(np.asarray(item_ids, dtype=object)).get_indexer(sel["item_id"])
+    for r, a, b in zip(rows, sel["start_d"], sel["end_d"]):
+        out[r, a - 1 : b] = np.nan
+    return out
+
+
+def _prob_no_run(p0: float, n: int, k: int) -> float:
+    """P(L_n < k): ninguna racha de ceros de largo ≥ k en n días Bernoulli(p0) independientes.
+
+    a_m = 1 si m < k y a_m = Σ_{j=0}^{k−1} p0^j (1 − p0) a_{m−j−1} si m ≥ k (el primer día con
+    venta llega después de j ceros). Es un filtro lineal, así que se resuelve con `lfilter`.
+    """
+    if n < k:
+        return 1.0
+    coef = (1 - p0) * p0 ** np.arange(k)
+    den = np.r_[1.0, -coef]
+    zi = lfiltic([1.0], den, y=np.ones(k))
+    out, _ = lfilter([1.0], den, np.zeros(n - k + 1), zi=zi)
+    return float(out[-1])
+
+
+def longest_run_threshold(p0: float, n: int, alpha: float) -> int | None:
+    """Menor k con P(racha de ceros más larga ≥ k) ≤ α en n días Bernoulli(p0) (FR-032, R15).
+
+    Parámetros:
+        p0 (float): tasa de ceros del artículo.
+        n (int): días activos.
+        alpha (float): probabilidad máxima de ver por azar una racha de largo ≥ k.
+
+    Retorno:
+        int | None: umbral; None si p0 ∈ {0, 1}, n < 1 o ningún k ≤ n cumple.
+    """
+    if n < 1 or not 0 < p0 < 1:
+        return None
+    if p0**n > alpha:  # incluso una racha de n días es probable: no hay umbral
+        return None
+    lo, hi = 1, n  # P(L_n ≥ k) decrece con k: búsqueda binaria del primer k que cumple
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if 1 - _prob_no_run(p0, n, mid) <= alpha:
+            hi = mid
+        else:
+            lo = mid + 1
+    return lo
+
+
+ZERO_THRESHOLD_COLUMNS = [
+    "item_id", "n_days", "p0", "threshold", "source", "reason", "ww_z", "ww_pvalue",
+]
+
+
+def zero_run_thresholds(
+    agg: dict, start_d: int, end_d: int, alpha: float, long_run: int
+) -> pd.DataFrame:
+    """Umbral de racha de ceros de cada artículo, estimado en [start_d, end_d] (FR-032, R15).
+
+    n y p₀ se miden en los días activos entre la primera y la última venta del rango (las rachas
+    de arranque y finales se tratan aparte). Si el umbral no se puede estimar se usa `long_run`
+    y `reason` dice por qué: `no_sales`, `no_zeros` (p₀ = 0), `all_zeros` (p₀ = 1) o
+    `no_threshold` (ningún k ≤ n cumple). Diagnóstico: prueba de rachas de Wald–Wolfowitz
+    (venta / sin venta) sobre los mismos días; z > 0 = menos rachas que el azar, ceros agrupados.
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_units`.
+        start_d (int): primer día (train).
+        end_d (int): último día (train).
+        alpha (float): `zero_alpha`.
+        long_run (int): respaldo `long_run`.
+
+    Retorno:
+        pd.DataFrame: columnas `ZERO_THRESHOLD_COLUMNS`; `source` = `estimated` o `fallback`.
+    """
+    u = _window(agg["item_units"], start_d, end_d)
+    ids = np.asarray(agg["item_ids"], dtype=object)
+    rows = []
+    for i in range(u.shape[0]):
+        x = u[i][~np.isnan(u[i])]
+        sales = np.flatnonzero(x > 0)
+        if not len(sales):
+            rows.append((ids[i], 0, np.nan, long_run, "fallback", "no_sales", np.nan, np.nan))
+            continue
+        zero = x[sales[0] : sales[-1] + 1] == 0
+        n, p0 = len(zero), float(zero.mean())
+        ww_z = ww_p = np.nan
+        if 0 < p0 < 1:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                # runstest_1samp devuelve z < 0 con pocas rachas; se cambia el signo.
+                z, ww_p = runstest_1samp(zero.astype(float), cutoff=0.5, correction=False)
+            ww_z = -float(z)
+        k = longest_run_threshold(p0, n, alpha)
+        if k is None:
+            reason = "no_zeros" if p0 == 0 else "all_zeros" if p0 == 1 else "no_threshold"
+            rows.append((ids[i], n, p0, long_run, "fallback", reason, ww_z, ww_p))
+        else:
+            rows.append((ids[i], n, p0, k, "estimated", None, ww_z, ww_p))
+    out = pd.DataFrame(rows, columns=ZERO_THRESHOLD_COLUMNS)
+    out["threshold"] = out["threshold"].astype("int64")
+    return out
+
+
+def mask_zero_runs(
+    item_units: np.ndarray,
+    item_ids,
+    thresholds: pd.Series,
+    start_d: int,
+    end_d: int,
+    kinds: tuple[str, ...] = ("leading", "internal", "trailing"),
+) -> np.ndarray:
+    """Copia de las unidades con ciertas rachas de ceros de [start_d, end_d] en NaN (FR-032).
+
+    - `internal`: rachas internas de largo ≥ umbral del artículo (los artículos sin umbral no se
+      tocan).
+    - `leading` y `trailing`: ceros antes de la primera venta y después de la última del rango.
+    Las posiciones se miden dentro del rango; el prelanzamiento ya es NaN y los ceros sueltos se
+    conservan. En el CV de XYZ se usan los tres tipos (como en la 6.4–6.5 del nb 02); en la serie
+    de participación, `leading` e `internal`.
+    Justificación (Principio III, b): CV de XYZ en train y en la réplica, y serie de pronóstico.
+
+    Parámetros:
+        item_units (np.ndarray): unidades por artículo y día (desde d_1).
+        item_ids (array-like): identificadores alineados con las filas.
+        thresholds (pd.Series): `item_id` → umbral (columna `threshold` de `zero_run_thresholds`).
+        start_d (int): primer día del rango.
+        end_d (int): último día del rango.
+        kinds (tuple[str, ...]): tipos de racha a enmascarar.
+
+    Retorno:
+        np.ndarray: unidades float64 del mismo tamaño que `item_units`.
+    """
+    ids = np.asarray(item_ids, dtype=object)
+    runs = zero_runs({"item_ids": ids, "item_units": item_units}, start_d, end_d)
+    thr = runs["item_id"].map(thresholds).to_numpy(dtype=float)
+    internal = (runs["position"] == "internal").to_numpy() & (runs["length"].to_numpy() >= thr)
+    edge = runs["position"].isin([k for k in kinds if k != "internal"]).to_numpy()
+    sel = runs[(internal & ("internal" in kinds)) | edge]
+    out = np.array(item_units, dtype=np.float64)
+    rows = pd.Index(ids).get_indexer(sel["item_id"])
+    for r, a, b in zip(rows, sel["start_d"], sel["end_d"]):
+        block = out[r, a - 1 : b]
+        block[block == 0] = np.nan  # los NaN previos de la racha se quedan como están
+    return out
+
+
+def seasonal_strength(series, period: int, robust: bool = False) -> dict:
+    """Fuerza estacional y de tendencia de una serie con STL (Hyndman y Athanasopoulos).
+
+    F_S = max(0, 1 − Var(R) / Var(S + R)) y F_T = max(0, 1 − Var(R) / Var(T + R)), con R el resto,
+    S la estacionalidad y T la tendencia de STL. Se recortan los ceros y NaN del inicio y del final
+    (antes de la primera venta y después de la última), y los NaN internos se interpolan
+    linealmente porque STL no admite faltantes. Por defecto STL no es robusta, como en la
+    definición de referencia y porque la robusta tarda unas 10 veces más (con M5, ~0,16 s frente a
+    ~0,015 s por serie diaria). Con `robust=True` los valores atípicos, como las rachas de ceros,
+    quedan en el resto y F_S baja. F_S no parte de 0 con ruido: con la ventana estacional por
+    defecto de STL, el ruido blanco da F_S ≈ 0,36 con período 7 (1.820 días) y ≈ 0,4–0,48 con
+    período 52 y 5 ciclos, así que los valores se leen contra esa línea base.
+    Justificación (Principio III, b): se usa con período semanal y anual en
+    `seasonal_strength_items`.
+
+    Parámetros:
+        series (array-like): valores en orden temporal.
+        period (int): período estacional (7 para días, 52 para semanas).
+        robust (bool): STL robusta a valores atípicos.
+
+    Retorno:
+        dict: `fs`, `ft`, `n_obs` y `n_interpolated`; `fs` y `ft` son NaN con menos de dos
+        períodos completos.
+    """
+    x = np.asarray(series, dtype=float)
+    pos = np.flatnonzero(x > 0)
+    empty = {"fs": np.nan, "ft": np.nan, "n_obs": 0, "n_interpolated": 0}
+    if not len(pos):
+        return empty
+    x = x[pos[0] : pos[-1] + 1]
+    n_interp = int(np.isnan(x).sum())
+    if len(x) < 2 * period:
+        return dict(empty, n_obs=len(x), n_interpolated=n_interp)
+    if n_interp:
+        x = pd.Series(x).interpolate(limit_direction="both").to_numpy()
+    fit = STL(x, period=period, robust=robust).fit()
+    r, s, t = fit.resid, fit.seasonal, fit.trend
+
+    def _strength(component: np.ndarray) -> float:
+        total = np.var(component + r)
+        return float(max(0.0, 1 - np.var(r) / total)) if total > 0 else np.nan
+
+    return {"fs": _strength(s), "ft": _strength(t), "n_obs": len(x), "n_interpolated": n_interp}
+
+
+def seasonal_strength_items(
+    agg: dict, start_d: int, end_d: int, week_of_day: np.ndarray, robust: bool = False
+) -> pd.DataFrame:
+    """Fuerza estacional semanal y anual de cada artículo.
+
+    - Semanal: serie diaria, período 7.
+    - Anual: unidades por semana `wm_yr_wk` completa, período 52. Una semana con algún día NaN
+      queda NaN y se interpola.
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_units`.
+        start_d (int): primer día.
+        end_d (int): último día.
+        week_of_day (np.ndarray): `wm_yr_wk` de cada día.
+        robust (bool): STL robusta (ver `seasonal_strength`).
+
+    Retorno:
+        pd.DataFrame: `item_id, fs_weekly, ft_weekly, fs_annual, ft_annual, n_weeks,
+        n_interpolated_weeks`.
+    """
+    u = _window(agg["item_units"], start_d, end_d)
+    weeks = _block_sums(u, _weekly_bounds(week_of_day, start_d, end_d))
+    rows = []
+    for i in range(u.shape[0]):
+        w = seasonal_strength(u[i], 7, robust)
+        a = seasonal_strength(weeks[i], 52, robust)
+        rows.append((w["fs"], w["ft"], a["fs"], a["ft"], a["n_obs"], a["n_interpolated"]))
+    out = pd.DataFrame(
+        rows,
+        columns=[
+            "fs_weekly",
+            "ft_weekly",
+            "fs_annual",
+            "ft_annual",
+            "n_weeks",
+            "n_interpolated_weeks",
+        ],
+    )
+    out.insert(0, "item_id", np.asarray(agg["item_ids"], dtype=object))
+    return out
+
+
+def monthly_seasonal_index(
+    agg: dict,
+    item_groups: pd.Series,
+    month_of_day: np.ndarray,
+    year_ranges: dict[str, tuple[int, int]],
+) -> pd.DataFrame:
+    """Índice estacional mensual por grupo: unidades diarias del mes / unidades diarias del año.
+
+    Se calcula por artículo y se resume con la mediana del grupo, para que los lanzamientos no
+    muevan el índice. Solo entran los artículos activos todo el año. Se usan medias diarias
+    porque los años de 364 días no empiezan el día 1 de un mes.
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_units`.
+        item_groups (pd.Series): grupo por `item_id` (p. ej. "AX").
+        month_of_day (np.ndarray): mes (1–12) de cada día; la posición j es el día j + 1.
+        year_ranges (dict): nombre del año → (día inicial, día final).
+
+    Retorno:
+        pd.DataFrame: `year, group, month, index, n_items`.
+    """
+    ids = np.asarray(agg["item_ids"], dtype=object)
+    groups = item_groups.reindex(ids).to_numpy()
+    rows = []
+    for year, (a, b) in year_ranges.items():
+        u = _window(agg["item_units"], a, b)
+        full = ~np.isnan(u).any(axis=1)
+        months = np.asarray(month_of_day)[a - 1 : b]
+        year_mean = u.mean(axis=1)
+        for m in np.unique(months):
+            # Los artículos no activos todo el año dan NaN aquí y se filtran con `full`.
+            with np.errstate(invalid="ignore", divide="ignore"):
+                ratio = u[:, months == m].mean(axis=1) / year_mean
+            frame = pd.DataFrame({"group": groups, "ratio": ratio})[full & (year_mean > 0)]
+            summary = (
+                frame.dropna(subset=["group"]).groupby("group")["ratio"].agg(["median", "size"])
+            )
+            for group, (median, size) in summary.iterrows():
+                rows.append((year, group, int(m), float(median), int(size)))
+    return pd.DataFrame(rows, columns=["year", "group", "month", "index", "n_items"])
+
+
+def classical_seasonal_index(
+    agg: dict,
+    item_classes: pd.Series,
+    dates,
+    start_d: int,
+    end_d: int,
+) -> dict:
+    """Índice estacional mensual por clase con el método clásico (razón a media móvil).
+
+    Por clase: (1) solo artículos con dato todos los días de [start_d, end_d], para que los
+    lanzamientos no creen saltos de nivel; (2) serie de unidades diarias promedio del agregado
+    en cada mes calendario completo (la media diaria evita el efecto de días por mes);
+    (3) media móvil centrada 2×12; (4) ratio = serie / media móvil; (5) promedio de los ratios
+    de cada mes entre años; (6) normalización para que los 12 índices sumen 12.
+
+    Parámetros:
+        agg (dict): agregado con `item_ids` e `item_units`.
+        item_classes (pd.Series): clase por `item_id` (p. ej. "A", "X" o "AX"); NaN o "-" se omiten.
+        dates: fecha de cada día; la posición j es el día j + 1.
+        start_d (int): primer día de la ventana.
+        end_d (int): último día de la ventana.
+
+    Retorno:
+        dict: `index` (clase × mes 1–12, normalizado), `ratios` (`class, period, month, ratio`),
+        `n_items` (artículos usados por clase) e `items` (`item_id` → clase de los usados).
+    """
+    ids = np.asarray(agg["item_ids"], dtype=object)
+    classes = item_classes.reindex(ids).to_numpy(dtype=object)
+    u = _window(agg["item_units"], start_d, end_d)
+    keep = ~np.isnan(u).any(axis=1) & pd.notna(classes) & (classes != "-")
+
+    period = pd.DatetimeIndex(np.asarray(dates)[start_d - 1 : end_d]).to_period("M")
+    counts = pd.Series(1, index=period).groupby(level=0).size()
+    complete = counts.index[counts.to_numpy() == counts.index.days_in_month]
+    if len(complete) < 24:
+        raise ValueError("se necesitan al menos 24 meses completos")
+
+    weights = np.r_[0.5, np.ones(11), 0.5] / 12
+    index_rows, ratio_frames = {}, []
+    for cls in sorted(set(classes[keep])):
+        daily = u[keep & (classes == cls)].sum(axis=0)
+        x = pd.Series(daily, index=period).groupby(level=0).mean().reindex(complete)
+        cma = np.convolve(x.to_numpy(), weights, mode="valid")  # alineada con x[6:-6]
+        with np.errstate(invalid="ignore", divide="ignore"):
+            ratio = x.to_numpy()[6:-6] / cma
+        centered = x.index[6:-6]
+        frame = pd.DataFrame(
+            {"class": cls, "period": centered, "month": centered.month, "ratio": ratio}
+        )
+        raw = frame.groupby("month")["ratio"].mean().reindex(range(1, 13))
+        index_rows[cls] = raw * 12 / raw.sum()
+        ratio_frames.append(frame)
+
+    items = pd.Series(classes[keep], index=ids[keep], name="class")
+    return {
+        "index": pd.DataFrame(index_rows).T.rename_axis(index="class", columns="month"),
+        "ratios": pd.concat(ratio_frames, ignore_index=True),
+        "n_items": items.value_counts().rename("n_items"),
+        "items": items,
+    }
+
+
+def _friedman_stat(ranks: np.ndarray) -> np.ndarray:
+    """Estadístico de Friedman sobre rangos (…, bloques, tratamientos), sin corrección por empates."""
+    b, k = ranks.shape[-2:]
+    r = ranks.sum(axis=-2)
+    return 12 / (b * k * (k + 1)) * (r**2).sum(axis=-1) - 3 * b * (k + 1)
+
+
+def friedman_seasonality(ratios: pd.DataFrame, n_perm: int = 10_000, seed: int = 0) -> pd.DataFrame:
+    """Prueba de Friedman de estacionalidad estable sobre los ratios del método clásico.
+
+    Bloques = años calendario con los 12 ratios; tratamientos = meses. H0: dentro de cada año
+    el orden de los meses es aleatorio (ningún mes tiende a quedar arriba o abajo). Como hay
+    pocos bloques, además del p-valor asintótico (χ² con 11 g.l.) se da uno por permutación:
+    se barajan los meses dentro de cada año. Kendall W = χ² / (b·(k − 1)) mide la consistencia
+    del orden entre años (0 = ninguna, 1 = el mismo orden todos los años).
+
+    Parámetros:
+        ratios (pd.DataFrame): `class, period, month, ratio` (salida de `classical_seasonal_index`).
+        n_perm (int): permutaciones para el p-valor exacto aproximado.
+        seed (int): semilla.
+
+    Retorno:
+        pd.DataFrame: por clase, `n_years, chi2, p_asymptotic, p_permutation, kendall_w`.
+    """
+    rng = np.random.default_rng(seed)
+    rows = {}
+    for cls, sub in ratios.groupby("class", sort=False):
+        table = (
+            sub.assign(year=sub["period"].dt.year)
+            .pivot(index="year", columns="month", values="ratio")
+            .reindex(columns=range(1, 13))
+            .dropna()
+        )
+        b, k = table.shape
+        if b < 2:
+            rows[cls] = {"n_years": b}
+            continue
+        ranks = rankdata(table.to_numpy(), axis=1)
+        stat = float(_friedman_stat(ranks))
+        perm = rng.permuted(np.tile(ranks, (n_perm, 1, 1)), axis=2)
+        p_perm = (1 + (_friedman_stat(perm) >= stat - 1e-9).sum()) / (n_perm + 1)
+        rows[cls] = {
+            "n_years": b,
+            "chi2": stat,
+            "p_asymptotic": float(chi2.sf(stat, k - 1)),
+            "p_permutation": float(p_perm),
+            "kendall_w": stat / (b * (k - 1)),
+        }
+    return pd.DataFrame.from_dict(rows, orient="index").rename_axis("class")
