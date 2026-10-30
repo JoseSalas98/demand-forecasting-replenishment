@@ -19,10 +19,10 @@ uno al gasto estimado? ¿Cuáles necesitan más promoción?
 
 ### Session 2026-10-24
 
-- Q: ¿Con qué frecuencia temporal se agregan las unidades de cada artículo para calcular su CV? → A: Por periodos de 28 días por defecto, como parámetro configurable (`cv_aggregation`) para experimentar con otras agregaciones (diaria, semanal, periodo de segmentación) solo dentro de train.
+- Q: ¿Con qué frecuencia temporal se agregan las unidades de cada artículo para calcular su CV? → A: Por periodos de 28 días por defecto, como parámetro configurable (`cv_aggregation`) para experimentar con otras agregaciones (diaria, semanal, periodo de segmentación) solo dentro de train. **Desde el 2026-10-29** ya no hay periodo de segmentación.
 - Q: ¿Qué regla individual hace que un artículo se considere "estable" en train? → A: Por defecto, misma clase ABC en las 3 comparaciones (XYZ puede variar y se reporta). La regla se elige con el parámetro `stability_rule`, y las alternativas (ABC y XYZ en las 3; misma celda en ≥2 de 3; clase A en los años 1 a 4) quedan implementadas como reglas intercambiables para experimentar con ellas.
 - Q: ¿Qué tratamientos existen para los productos objetivo y qué regla asigna cada uno? → A: Mapeo por celda en la configuración (`treatment_map`): AX → abastecimiento regular (guiado por pronóstico), AY → abastecimiento con revisión periódica, AZ → prioridad de promoción / revisión de demanda.
-- Q: ¿Cómo se obtiene la clase de referencia de un artículo frente al promedio de años previos? → A: Se promedia el gasto anual del artículo sobre los años previos activos y se reclasifica ABC sobre ese promedio; para XYZ se promedia su CV anual.
+- Q: ¿Cómo se obtiene la clase de referencia de un artículo frente al promedio de años previos? → A: Se promedia el gasto anual del artículo sobre los años previos activos y se reclasifica ABC sobre ese promedio; para XYZ se promedia su CV anual. **Reemplazada el 2026-10-29** (base año anterior y Y1 fija).
 - Q: ¿Cómo se identifica la fecha de lanzamiento de un artículo? → A: Primera `wm_yr_wk` con precio en el archivo de precios, por tienda; el artículo agregado empieza en el lanzamiento más temprano entre tiendas.
 - Q: ¿El modelo se elige por producto objetivo o por grupo? → A: No se fija en la spec; es el parámetro `selection_level`, cuyas etiquetas define el analista durante la experimentación, declarado antes del backtesting y congelado con el modelo.
 
@@ -30,12 +30,23 @@ uno al gasto estimado? ¿Cuáles necesitan más promoción?
 
 - Q: ¿En qué orden se ejecutan la exploración de cinco años, el análisis sobre train, la mirada al año 5 y el pronóstico? → A: Primero la exploración descriptiva global de los cinco años; después la matriz y la estabilidad sobre train, cuyo resultado se congela; luego se replica sobre el año 5 lo congelado; y recién después se hace el pronóstico (backtesting en train y evaluación única en test).
 - Q: ¿Cómo se evita que la réplica en el año 5 influya en la elección del modelo? → A: Los candidatos de pronóstico y `selection_level` se declaran antes de la réplica; cambiarlos después exige una nueva versión. La réplica no modifica la lista ni el tratamiento, y ninguna etapa de selección la lee.
-- Q: ¿Qué calcula la réplica en el año 5? → A: La matriz ABC × XYZ del año 5 con los cortes, umbrales y agregación del CV congelados; el acuerdo y el PSI del año 5 frente al promedio de los años 1 a 4 y frente a la matriz global de train; y, por producto objetivo, si mantiene su clase y su celda.
+- Q: ¿Qué calcula la réplica en el año 5? → A: La matriz ABC × XYZ del año 5 con los cortes, umbrales y agregación del CV congelados; el acuerdo y el PSI del año 5 frente al promedio de los años 1 a 4 y frente a la matriz global de train; y, por producto objetivo, si mantiene su clase y su celda. **Actualizada el 2026-10-29:** bases Y4 y Y1 y medidas pareadas, sin PSI.
 
 ### Session 2026-10-27
 
 - Q: ¿Los cortes ABC y los umbrales XYZ son valores fijos? → A: No. Los valores por defecto (80/95 % y 10/25 %) son un punto de partida experimental. El valor definitivo se elige solo con train y se congela (FR-020). El método para elegirlo no se fija en la spec: puede ser determinista o algorítmico, con el criterio declarado antes de ejecutarlo.
 - Q: ¿Puede la exploración de cinco años usar el año 5? → A: Sí, solo como línea base descriptiva para saber qué esperar al explorar por años (incluida la exploración inter e intraanual). Probar cortes en ella es exploración y no decide nada; los cortes que se congelan salen de train.
+
+### Session 2026-10-29
+
+Alineación con la constitución 2.0.0, a partir de lo aprendido en la exploración (nb 01–02).
+
+- Q: ¿Contra qué se compara cada año en la estabilidad de train? → A: Con dos bases y los mismos artículos: el año anterior (Yt−1 → Yt) y el año 1 fijo (Y1 → Yt), sin promediar años. Los cortes se eligen en la base y se aplican al objetivo por participación en el gasto. Motivo: el promedio de años previos mueve los cortes y el crecimiento del catálogo encoge la clase A sin que los artículos cambien.
+- Q: ¿Con qué se mide la estabilidad? → A: Con medidas pareadas, porque base y objetivo son los mismos artículos: kappa de Cohen plano, Stuart–Maxwell y mayor cambio en puntos porcentuales, más mantiene / mejora / empeora (y mixto en ABC × XYZ). El PSI se deja de usar.
+- Q: ¿Se elige un periodo de segmentación (trimestre o cuatrimestre)? → A: No. La exploración intraanual no mostró que la clase dependa de la época del año; la clase se define por año.
+- Q: ¿Cómo se tratan los ceros internos? → A: Las rachas de ceros iguales o más largas que el umbral del artículo se tratan como no observadas (NaN) en el CV de XYZ y en la serie de participación. El umbral es el menor k tal que la probabilidad de que la racha más larga sea ≥ k, con días independientes y la tasa de ceros observada del artículo en train, es ≤ α (por defecto 0,01). Wald–Wolfowitz por artículo como diagnóstico; si no se puede estimar, `LONG_RUN` = 7.
+- Q: ¿Dónde caen los folds del backtesting? → A: 13 orígenes cada 28 días repartidos en el año 4, igual que el test, para que la selección vea todo el ciclo anual.
+- Q: ¿Cómo se eligen los cortes de train? → A: ABC con la regla de % de artículos y % de gasto, y XYZ con la búsqueda de cortes sobre la distribución del CV; se ejecutan sobre train y se congelan.
 
 ## Orden de ejecución
 
@@ -56,7 +67,9 @@ promoción y abastecimiento. Todos los artículos se analizan agregados sobre to
 
 El analista describe primero los productos con los cinco años: ABC por gasto, XYZ,
 distribuciones, proporción de ceros, media frente a mediana, y estabilidad anual y global, además de
-la exploración inter e intraanual. Usa el año 5 solo como línea base. Es solo descriptivo.
+la exploración inter e intraanual, el origen de los ceros (arranque, rachas largas, ceros finales o
+demanda intermitente) y la fuerza estacional. Usa el año 5 solo como línea base. Es solo
+descriptivo.
 
 **Why this priority**: es la primera etapa del análisis y da el contexto global antes de trabajar
 sobre la partición de train. No decide nada del modelo.
@@ -107,8 +120,8 @@ tienda-semana), el porcentaje acumulado, el CV y la clase asignada.
 
 ### User Story 3 - Estabilidad estacional, lista objetivo y tratamiento (Priority: P3)
 
-El analista evalúa con datos de train si la clasificación de cada artículo se mantiene año a año y
-dentro de los periodos de segmentación candidatos. Con eso obtiene la lista congelada de productos
+El analista evalúa con datos de train si la clasificación de cada artículo se mantiene de un año a
+otro. Con eso obtiene la lista congelada de productos
 objetivo (clase A y estables en train) y el tratamiento de cada uno según su gasto y su
 predictibilidad (CV).
 
@@ -121,15 +134,16 @@ la lista resultante solo contenga artículos de clase A que cumplen el criterio 
 
 **Acceptance Scenarios**:
 
-1. **Given** candidatos de periodo de segmentación y un criterio de elección declarados antes de
-   ejecutar, **When** se ejecuta el análisis, **Then** se elige un periodo según ese criterio y el
-   registro muestra que los candidatos y el criterio se declararon antes de la ejecución.
-2. **Given** los años 1 a 4, **When** se comparan las distribuciones, **Then** se compara el año 2
-   contra el año 1, el año 3 contra el promedio de los años 1 y 2, y el año 4 contra el promedio de
-   los años 1 a 3. El promedio de referencia es el promedio simple de las distribuciones previas.
-3. **Given** las matrices anuales y la matriz global de train, **When** se miden los acuerdos,
-   **Then** se reportan el porcentaje de artículos con la misma clase en cada año y en la global,
-   y el PSI sobre la proporción de clases, comparados con sus umbrales configurados.
+1. **Given** la regla de estabilidad y los parámetros declarados antes de ejecutar, **When** se
+   ejecuta el análisis, **Then** el registro muestra que se declararon antes de la ejecución.
+2. **Given** los años 1 a 4, **When** se comparan, **Then** cada año t (2 a 4) se compara con el
+   año anterior y con el año 1, solo con los artículos activos todos los días de los dos años, con
+   los cortes elegidos en la base y aplicados al objetivo por participación en el gasto.
+3. **Given** cada comparación, **When** se miden los cambios, **Then** se reportan para ABC, XYZ y
+   ABC × XYZ el kappa de Cohen plano, Stuart–Maxwell, el mayor cambio en puntos porcentuales y el %
+   que mantiene, mejora, empeora (y mixto en ABC × XYZ), junto con una línea base de ruido
+   dentro del mismo año. La matriz global de train se compara con las anuales con las mismas
+   medidas.
 4. **Given** el criterio de estabilidad por artículo, **When** se construye la lista objetivo,
    **Then** la lista contiene solo artículos de clase A estables en train, cada uno con su
    tratamiento, y queda serializada y congelada.
@@ -155,9 +169,9 @@ ninguna etapa de selección de modelos lea el resultado.
 
 1. **Given** la lista objetivo congelada y los candidatos de pronóstico y `selection_level`
    declarados, **When** se ejecuta la réplica, **Then** se calcula la matriz ABC × XYZ del año 5
-   con los parámetros congelados, el acuerdo y el PSI del año 5 frente al promedio de los años 1 a
-   4 y frente a la matriz global de train, y por producto objetivo si mantiene su clase y su
-   celda. La lista y el tratamiento no cambian.
+   con los parámetros congelados, las medidas pareadas del año 5 frente al año 4 y frente al
+   año 1 (FR-017), y por producto objetivo si mantiene su clase y su celda. La lista y el
+   tratamiento no cambian.
 2. **Given** que la lista objetivo no está congelada o que los candidatos de pronóstico no están
    declarados, **When** se pide la réplica, **Then** el proceso se detiene y lo indica.
 3. **Given** la réplica terminada, **When** se ejecuta el backtesting, **Then** ninguna etapa de
@@ -208,7 +222,10 @@ mismo conjunto y los mismos 13 orígenes.
 - **Artículo con media de unidades igual a cero en el periodo (CV indefinido):** no recibe clase
   XYZ y se registra con motivo.
 - **Artículo sin ventas en un año de train después de su lanzamiento:** se conservan los ceros
-  como ceros ambiguos; no se interpretan como quiebre de stock.
+  como ceros ambiguos; no se interpretan como quiebre de stock, salvo las rachas que superan el
+  umbral del artículo (FR-032), que se tratan como no observadas.
+- **Artículo sin días con cero o con ceros en todos los días activos:** la tasa de ceros es 0 o 1
+  y el umbral no se puede estimar; se usa `LONG_RUN` y se registra el motivo.
 - **Artículo cuyo gasto acumulado cruza un corte ABC:** recibe la clase del tramo en que está
   su porcentaje acumulado antes de sumarse (ver Assumptions).
 - **Empates de gasto en el límite de un corte:** el orden se desempata de forma determinista por
@@ -221,7 +238,7 @@ mismo conjunto y los mismos 13 orígenes.
   tratamiento no cambian.
 - **Ningún modelo supera al seasonal naive:** el RMV no se cierra; se reporta el resultado.
 - **Parámetro fuera de rango** (cortes ABC no crecientes, umbrales XYZ negativos o no crecientes,
-  umbrales PSI negativos): el proceso se detiene antes de calcular.
+  α fuera de (0, 1) o `LONG_RUN` < 1): el proceso se detiene antes de calcular.
 - **Cambio de parámetro después de la réplica en el año 5 o de ver el test:** exige una nueva
   versión y repetir desde la matriz sobre train.
 
@@ -264,38 +281,51 @@ mismo conjunto y los mismos 13 orígenes.
 - **FR-011**: El sistema DEBE ordenar los artículos de mayor a menor gasto, calcular gasto
   acumulado y porcentaje acumulado, y asignar A hasta el corte A (por defecto 80 %), B hasta el
   corte B (por defecto 95 %) y C al resto. Los cortes por defecto son un punto de partida
-  experimental (ver FR-013).
+  experimental; los de train salen de la regla de % de artículos y % de gasto (ver FR-013).
 - **FR-012**: El sistema DEBE calcular el CV de cada artículo agregado como desviación estándar /
   media de sus unidades, en porcentaje, sobre la serie de unidades agregadas según el parámetro
   `cv_aggregation` (por defecto, bloques de 28 días alineados con el horizonte de pronóstico;
-  alternativas: diaria, semanal `wm_yr_wk` o periodo de segmentación). Los bloques incompletos
-  por lanzamiento o por el borde del periodo se excluyen del cálculo. Las alternativas a
+  alternativas: diaria o semanal `wm_yr_wk`). Los bloques incompletos por lanzamiento, por el
+  borde del periodo o por días no observados (FR-032) se excluyen del cálculo. Las alternativas a
   comparar y el criterio de elección DEBEN declararse antes de experimentar, la elección se hace
   solo con train y el valor elegido queda congelado con la matriz.
 - **FR-013**: El sistema DEBE asignar X si CV < umbral X (por defecto 10 %), Y si umbral X ≤ CV <
   umbral Z (por defecto 25 %) y Z si CV ≥ umbral Z. Los valores por defecto son de práctica y
-  son un punto de partida experimental: los definitivos (ABC y XYZ) se eligen solo con train, con
-  cualquier método determinista o algorítmico cuyo criterio se declare antes de ejecutarlo, y se
-  congelan con la matriz (FR-020). No se fija un método de antemano.
+  son un punto de partida experimental: los definitivos se eligen solo con train y se congelan
+  con la matriz (FR-020). Método declarado: ABC con la regla de % de artículos y % de gasto
+  (A 10–20 % y 60–80 %; B 20–30 % y 20–30 %; menor violación y, en empate, el más cercano al
+  centro) y XYZ con la búsqueda de cortes sobre la distribución del CV (mínimo de artículos por
+  segmento y gasto medio descendente de X a Z).
+- **FR-032**: El sistema DEBE estimar con train, para cada artículo, un umbral de racha de ceros:
+  el menor k tal que la probabilidad de que la racha de ceros más larga sea ≥ k, en sus n días
+  activos y con días independientes con su tasa de ceros observada p₀, sea ≤ α (por defecto
+  0,01, en la configuración). Las rachas internas de ceros de largo ≥ k se tratan como no
+  observadas (NaN) en el CV de XYZ y en la serie de participación; los ceros de arranque y finales
+  se tratan igual que en la exploración. La prueba de rachas de Wald–Wolfowitz por artículo se
+  reporta como diagnóstico. Si el umbral no se puede estimar, se usa `LONG_RUN` (por defecto 7) y
+  se registra el motivo. Los umbrales se congelan (FR-020).
 - **FR-014**: El sistema DEBE entregar el ranking con gasto, porcentaje acumulado, CV, clase ABC,
   clase XYZ y celda ABC × XYZ de cada artículo, y serializarlo una vez.
 
-**Estabilidad estacional y lista objetivo (train)**
+**Estabilidad y lista objetivo (train)**
 
-- **FR-015**: El sistema DEBE exigir que los candidatos de periodo de segmentación y el criterio de
-  elección estén declarados en la configuración antes de ejecutar el análisis de estabilidad.
-- **FR-016**: El sistema DEBE comparar el año 2 contra el año 1, el año 3 contra el promedio simple
-  de los años 1 y 2, y el año 4 contra el promedio simple de los años 1 a 3. La clase de
-  referencia de cada artículo se obtiene así: su gasto anual se promedia sobre los años previos
-  y se vuelve a clasificar ABC sobre ese promedio; su CV anual se promedia sobre los años previos
-  y se clasifica XYZ con los umbrales configurados. Solo cuentan en el promedio los años en que
-  el artículo estuvo activo (posteriores a su lanzamiento).
-- **FR-017**: El sistema DEBE calcular la matriz global de train y contrastarla con cada matriz
-  anual mediante el porcentaje de artículos con la misma clase y el PSI sobre la proporción de
-  clases, con umbrales configurables.
+- **FR-015**: El sistema DEBE exigir que la regla de estabilidad, α, `LONG_RUN` y el mapeo de
+  tratamientos estén declarados en la configuración antes de ejecutar el análisis de estabilidad.
+  La clase se define por año; NO se elige un periodo de segmentación dentro del año.
+- **FR-016**: El sistema DEBE comparar cada año t de train (2 a 4) con dos bases: el año anterior
+  (t − 1 → t) y el año 1 (1 → t). En cada comparación entran solo los artículos activos todos los
+  días de los dos años, sin promediar años. Los cortes ABC y XYZ se eligen en la base con el
+  método de FR-013; el objetivo se clasifica ABC por su participación en el gasto con las
+  fronteras de la base, y XYZ con los umbrales de la base.
+- **FR-017**: El sistema DEBE medir cada comparación, y la de la matriz global de train frente a
+  cada matriz anual, para ABC, XYZ y ABC × XYZ, con: kappa de Cohen plano; Stuart–Maxwell
+  (homogeneidad marginal pareada); el mayor cambio del % de artículos de una clase, en puntos
+  porcentuales; y el % que mantiene, mejora o empeora (en ABC × XYZ, por dimensión, con `mixto`
+  cuando sube en una y baja en la otra). Como línea base de ruido, DEBE medir lo mismo entre
+  semanas alternas del mismo año. El PSI NO se usa.
 - **FR-018**: El sistema DEBE marcar como estable en train a un artículo según la regla elegida
   en el parámetro `stability_rule`. Por defecto (`abc_all`), un artículo es estable si tiene la
-  misma clase ABC en las 3 comparaciones (año 2, 3 y 4 frente a su referencia). La clase XYZ
+  misma clase ABC en las 3 comparaciones con la base del año anterior (año 2, 3 y 4). La clase XYZ
   puede variar, y sus cambios se reportan. DEBEN estar disponibles como reglas intercambiables,
   con la misma entrada (clases por artículo y comparación) y la misma salida (estable sí/no):
   - `abc_all` (por defecto): misma clase ABC en las 3 comparaciones.
@@ -312,9 +342,9 @@ mismo conjunto y los mismos 13 orígenes.
   defecto: **AX** → abastecimiento regular (guiado por pronóstico), **AY** → abastecimiento con
   revisión periódica, **AZ** → prioridad de promoción / revisión de demanda. Un producto objetivo
   cuya celda no tenga tratamiento en el mapeo detiene el proceso.
-- **FR-020**: El sistema DEBE serializar y congelar la lista objetivo, su tratamiento, el periodo
-  de segmentación elegido, los cortes ABC, los umbrales XYZ, la agregación del CV, la regla de estabilidad y el mapeo de tratamientos. Las etapas siguientes DEBEN
-  cargarlos sin recalcularlos.
+- **FR-020**: El sistema DEBE serializar y congelar la lista objetivo, su tratamiento, los cortes
+  ABC, los umbrales XYZ, la agregación del CV, los umbrales de racha por artículo, la regla de
+  estabilidad y el mapeo de tratamientos. Las etapas siguientes DEBEN cargarlos sin recalcularlos.
 - **FR-021**: El análisis de estabilidad NO DEBE usar ningún dato del año 5.
 
 **Pronóstico y evaluación**
@@ -327,7 +357,9 @@ mismo conjunto y los mismos 13 orígenes.
 - **FR-024**: La selección de modelos y órdenes DEBE hacerse solo con backtesting dentro de train.
   El nivel al que se elige el modelo (por producto, global o por grupo) se lee del parámetro
   `selection_level`, cuyas etiquetas define el analista en la experimentación. El valor DEBE
-  declararse antes de la réplica en el año 5 y queda congelado con el modelo.
+  declararse antes de la réplica en el año 5 y queda congelado con el modelo. El backtesting usa
+  13 orígenes cada 28 días repartidos en el año 4, sin solapamiento, igual que el test, para que
+  la selección cubra todo el ciclo anual.
 - **FR-025**: El sistema DEBE evaluar en test cada modelo una única vez, en 13 orígenes cada 28 días,
   sin reentrenar y con parámetros fijos, actualizando solo los datos observados.
 - **FR-026**: El sistema DEBE convertir la participación a unidades usando el total real de la
@@ -345,8 +377,8 @@ mismo conjunto y los mismos 13 orígenes.
 - **FR-030**: Una vez congelados la lista objetivo y su tratamiento (FR-020), y declarados los
   candidatos de pronóstico y `selection_level` (FR-023, FR-024), y antes del backtesting, el
   sistema DEBE replicar sobre el año 5 la matriz ABC × XYZ con los cortes, umbrales y agregación
-  del CV congelados, y reportar el acuerdo y el PSI del año 5 frente al promedio de los años 1 a 4
-  y frente a la matriz global de train, y por producto objetivo si mantiene su clase y su celda.
+  del CV congelados, y reportar las medidas de FR-017 del año 5 frente al año 4 y frente al año
+  1, y por producto objetivo si mantiene su clase y su celda.
   La réplica NO DEBE modificar la lista, el tratamiento ni los candidatos, y ninguna etapa de
   selección de modelos DEBE leerla.
 - **FR-031**: El informe final DEBE presentar los resultados como backtesting sobre datos
@@ -363,8 +395,11 @@ mismo conjunto y los mismos 13 orígenes.
   unitario.
 - **Calendario**: fechas, semana (`wm_yr_wk`), eventos y SNAP, conocidos de antemano.
 - **Matriz ABC × XYZ**: asignación de clases por artículo para un conjunto de cálculo (train
-  global, año o periodo de segmentación).
-- **Medida de estabilidad**: porcentaje de acuerdo y PSI entre una matriz y su referencia.
+  global o año).
+- **Medida de estabilidad**: kappa, Stuart–Maxwell, cambio en puntos porcentuales y movimientos
+  entre una matriz y su base, por nivel (ABC, XYZ, ABC × XYZ).
+- **Umbral de racha**: por artículo, largo mínimo de una racha de ceros no observada, con su tasa
+  de ceros, el diagnóstico de Wald–Wolfowitz y el motivo si se usó `LONG_RUN`. Congelado.
 - **Producto objetivo**: artículo de clase A estable en train, con su tratamiento. Congelado.
 - **Réplica del año 5**: matriz y estabilidad del año 5 calculadas con los parámetros congelados,
   y permanencia de clase y celda de cada producto objetivo. Solo diagnóstico.
@@ -423,21 +458,19 @@ elegido supera al seasonal naive.
 - **Rango temporal:** M5 cubre aproximadamente del 2011-01-29 al 2016-06-19. Las fechas exactas de
   train y test, y cómo se reparten los días que sobran de los cinco años, se fijan en el plan tras
   verificarlas en la documentación oficial.
-- **Ceros:** los ceros dentro del periodo activo son ambiguos y se mantienen como ceros.
+- **Ceros:** los ceros dentro del periodo activo son ambiguos y se mantienen como ceros, salvo
+  las rachas que superan el umbral del artículo (FR-032). El umbral es conservador: la tasa de
+  ceros observada incluye esas mismas rachas.
 - **Corte ABC:** un artículo es A si su porcentaje acumulado antes de sumarse es menor que el
   corte A; así el artículo que cruza el 80 % queda en A. Ídem para B.
 - **Límites XYZ:** se usa X < 10 %, 10 % ≤ Y < 25 %, Z ≥ 25 %. La descripción original decía
   "Z > 25 %", lo que dejaba sin clase un CV de exactamente 25 %.
-- **Promedio de referencia:** promedio simple de las distribuciones de los años previos (para
-  PSI) y, por artículo, promedio simple de su gasto y CV anuales en los años previos activos
-  (ver FR-016). Para la réplica en el año 5, los años previos son los años 1 a 4.
+- **Bases de comparación:** año anterior y año 1 (FR-016). Para la réplica en el año 5, el año 4 y
+  el año 1.
 - **Ponderación del WRMSSE:** sigue la definición de Makridakis et al. (2022), con pesos por gasto
   estimado de los últimos 28 días de train y escala por el error naive de un paso en train.
-- **Periodo de segmentación:** intervalo dentro del año (por ejemplo, trimestre o cuatrimestre),
-  distinto del periodo estacional m de SARIMA. Los candidatos por defecto son trimestral y
-  cuatrimestral.
 - **Pendientes que se resuelven en el plan o la experimentación:** valor del periodo de uso,
-  umbrales PSI y de acuerdo, significado y cobertura de `wm_yr_wk`, forma de serialización,
+  umbral de kappa para leer la estabilidad, significado y cobertura de `wm_yr_wk`, forma de serialización,
   redondeo al convertir participación a unidades, ventanas de medias móviles en días, tamaño del
   subconjunto y candidatos de búsqueda, etiquetas de `selection_level` (nivel de selección del
   modelo), y versiones de Python y librerías.
