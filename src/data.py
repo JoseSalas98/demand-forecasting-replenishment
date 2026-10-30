@@ -360,6 +360,27 @@ def aggregate_items(
     }
 
 
+def active_stores_by_item(units: np.ndarray, series_index: pd.DataFrame) -> np.ndarray:
+    """Cuenta, por artículo y día, las tiendas con dato válido (no NaN).
+
+    Un cero del artículo agregado significa cero en todas las tiendas con dato. Si son pocas, el
+    agregado se comporta como una serie de una sola tienda; este conteo permite verlo.
+
+    Parámetros:
+        units (np.ndarray): unidades enmascaradas por serie tienda-artículo y día.
+        series_index (pd.DataFrame): orden de las series (`item_id`).
+
+    Retorno:
+        np.ndarray: int16 (artículos × día), con filas en el orden de `item_ids` de
+        `aggregate_items` (artículos ordenados).
+    """
+    item_codes, _ = pd.factorize(series_index["item_id"], sort=True)
+    order = np.argsort(item_codes, kind="stable")
+    starts = np.flatnonzero(np.r_[True, np.diff(item_codes[order]) != 0])
+    valid = (~np.isnan(np.asarray(units)))[order]
+    return np.add.reduceat(valid, starts, axis=0, dtype=np.int16)
+
+
 def save_interim(arrays: dict, tables: dict) -> None:
     """Escribe los arreglos (.npy) y tablas (Parquet) intermedios en `data/interim/`.
 
