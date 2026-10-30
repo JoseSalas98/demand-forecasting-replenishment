@@ -12,7 +12,12 @@ congelado sobre el año 5. Por último, pronosticar la participación diaria en 
 elegir el modelo con backtesting en train y evaluar una sola vez en el año 5 (13 orígenes) con
 WRMSSE frente al seasonal naive.
 
-**Orden de etapas (constitución v1.1.0):** validación → EDA de cinco años → matriz de train →
+**Actualización 2026-10-29 (constitución 2.0.0):** estabilidad pareada con bases año anterior y
+Y1 (R14), sin periodo de segmentación, umbral de racha de ceros por artículo (R15) y backtesting
+con 13 orígenes en Y4 (R16). Todavía no hay artefactos congelados, así que no hay que repetir
+nada.
+
+**Orden de etapas (constitución 2.0.0):** validación → EDA de cinco años → matriz de train →
 estabilidad y lista objetivo → declaración de candidatos de pronóstico y réplica en el año 5 →
 backtesting → evaluación en test → informe. Ver research R13.
 Detalle: [research.md](research.md) · [data-model.md](data-model.md) · [contracts/](contracts/) ·
@@ -40,11 +45,11 @@ parámetros de config con valores por defecto documentados ([contracts/params.md
 | Principio | Cómo cumple el diseño | Antes | Después |
 |---|---|---|---|
 | I Alcance | Las salidas son la matriz, la lista objetivo y el pronóstico de participación. El reporte aclara que no es una orden de compra. | ✅ | ✅ |
-| II Dominio | Unidades enteras ≥ 0. Precio > 0 por tienda-artículo-`wm_yr_wk`. Gasto = Σ unidades × precio diario, nunca precio medio × unidades. El prelanzamiento por tienda se enmascara (NaN, no 0). Los ceros con actividad se conservan. La participación usa el total real de la cadena. | ✅ | ✅ |
+| II Dominio | Unidades enteras ≥ 0. Precio > 0 por tienda-artículo-`wm_yr_wk`. Gasto = Σ unidades × precio diario, nunca precio medio × unidades. El prelanzamiento por tienda se enmascara (NaN, no 0). Los ceros con actividad se conservan, salvo las rachas que superan el umbral del artículo (FR-032), que pasan a NaN sin afirmar su causa. La participación usa el total real de la cadena. | ✅ | ✅ |
 | III Código/parámetros | Código en inglés, docstrings en español. Un único `src/config/params.toml` más `params_history.csv`. Código en `src/`, notebooks en `notebooks/`, sin carpetas nuevas en la raíz. | ✅ | ✅ |
 | IV Errores | `rejections.parquet` y `fit_failures.parquet`. Calendario inválido, parámetro fuera de rango, lista vacía o celda sin tratamiento detienen el proceso. | ✅ | ✅ |
 | V Fuente de la verdad | Los artefactos congelados se escriben una vez, con hash SHA-256 en `manifest.json`. Las etapas posteriores los cargan y verifican, nunca los recalculan. | ✅ | ✅ |
-| VI Método/congelamiento | Todas las decisiones usan solo train. Candidatos y criterios se declaran en config antes de ejecutar. `test_ledger.json` permite una sola evaluación en test por modelo. Test usa parámetros congelados (`SARIMAX.smooth`), sin reajuste. El EDA de 5 años va primero y la réplica en el año 5 va después de congelar la lista y declarar las claves de `[forecast]`; ninguna etapa de decisión lee la salida de ninguno de los dos, y el backtest se detiene si una clave de `[forecast]` cambió después de la réplica. | ✅ | ✅ |
+| VI Método/congelamiento | Todas las decisiones usan solo train: cortes de train con `select_abc_cuts` y `find_cv_cuts`, estabilidad pareada con bases año anterior y Y1 (sin promedios ni PSI), umbrales de racha estimados en train y backtest con 13 orígenes en Y4. Candidatos y criterios se declaran en config antes de ejecutar. `test_ledger.json` permite una sola evaluación en test por modelo. Test usa parámetros congelados (`SARIMAX.smooth`), sin reajuste. El EDA de 5 años va primero y la réplica en el año 5 va después de congelar la lista y declarar las claves de `[forecast]`; ninguna etapa de decisión lee la salida de ninguno de los dos, y el backtest se detiene si una clave de `[forecast]` cambió después de la réplica. | ✅ | ✅ |
 | VII Métricas | WRMSSE (Makridakis et al., 2022) es la principal, WAPE secundaria, RMSE de diagnóstico, sin MAPE. Se acepta solo si WRMSSE < seasonal naive. | ✅ | ✅ |
 
 **Abstracciones (Principio III):**
@@ -54,7 +59,9 @@ parámetros de config con valores por defecto documentados ([contracts/params.md
 | dict `STABILITY_RULES` (4 reglas) | (a) |
 | dict `FORECASTERS` (snaive, moving_average, arima, sarima) | (a) |
 | `classify_abc` / `classify_xyz` | (b): se usan en el EDA, en las matrices global, anuales y por periodo, en la referencia y en la réplica del año 5 |
-| `reference_classes` | (b): se usa en las comparaciones Y2–Y4 y en la réplica Y5 frente a Y1–Y4 |
+| `base_target_classes` | (b): estabilidad en train (Y2–Y4), réplica en Y5 y exploración del nb 02 |
+| `transition_stats` | (b): estabilidad en train, réplica en Y5, intraanual del nb 02 |
+| `zero_run_thresholds` | (b): CV de XYZ y serie de participación (FR-032) |
 | métricas (`wrmsse`, `wape`, `rmse`) | (b): se usan en backtest y en test |
 | `freeze` / `load_frozen` + manifiesto | (b), (c) |
 | `TestLedger` | (c) |
@@ -72,8 +79,8 @@ src/
 ├── config/params.toml, params_history.csv
 ├── config.py         # carga, validación de rangos, verificación del historial
 ├── data.py           # carga M5, validación, rechazos, lanzamiento, arreglos anchos, partición
-├── segmentation.py   # uso, gasto, ABC, CV, XYZ, matriz, descripción de cinco años
-├── stability.py      # matrices anuales/por periodo, referencia, acuerdo, PSI, reglas, lista objetivo, tratamiento, réplica Y5
+├── segmentation.py   # uso, gasto, ABC, CV, XYZ, cortes de train, umbral de rachas de ceros, matriz, descripción de cinco años
+├── stability.py      # matrices anuales, comparaciones pareadas (año anterior y Y1), kappa/Stuart–Maxwell, ruido, reglas, lista objetivo, tratamiento, réplica Y5
 ├── forecasting.py    # series de participación, pronosticadores, backtest, evaluación en test
 ├── metrics.py        # RMSSE/WRMSSE, WAPE, RMSE
 ├── freeze.py         # serialización, manifiesto, TestLedger

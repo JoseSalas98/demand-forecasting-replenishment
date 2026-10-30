@@ -91,6 +91,8 @@ Probar cortes en la exploración de cinco años es solo exploración y no decide
 
 ## R6. Estabilidad, referencia y periodo de segmentación
 
+> **Reemplazada en parte el 2026-10-29:** la referencia promediada, el PSI y el periodo de segmentación se sustituyen por R14.
+
 **Decisión**:
 - **Clase de referencia** (por artículo): promediar el gasto anual del artículo sobre los años
   *activos* previos y volver a aplicar ABC sobre esos promedios para todos los artículos.
@@ -119,6 +121,8 @@ AZ = "promotion_priority"}`. Si la celda de un artículo objetivo (por ejemplo `
 está definido) no tiene tratamiento, el proceso se detiene.
 
 ## R8. Pronosticadores y backtesting
+
+> **Actualizada el 2026-10-29:** el backtest pasa a 13 orígenes en Y4 (R16) y la serie de participación usa NaN en las rachas de ceros (R15).
 
 **Decisión**:
 - **Serie objetivo**: participación diaria = unidades del artículo / unidades totales de la
@@ -251,3 +255,51 @@ modelo.
 información sobre la segmentación en Y5 para después del pronóstico, lo que no corresponde al
 flujo de análisis); réplica antes del pronóstico sin declarar antes los candidatos (más flexible,
 pero lo visto en Y5 podría sesgar la elección del modelo).
+
+## R14. Estabilidad pareada (2026-10-29, reemplaza la referencia promediada de R6)
+
+- **Decisión**: cada año t de train (Y2–Y4) se compara con dos bases, el año anterior y Y1, con
+  `base_target_classes` (mismos artículos: activos todos los días de los dos años; cortes elegidos
+  en la base con `select_abc_cuts` y `find_cv_cuts`; el objetivo se clasifica ABC por participación
+  con `classify_abc_share`). Medidas con `transition_stats` en `abc`, `xyz` y `cell`: kappa plano,
+  Stuart–Maxwell, `max_shift_pp`, mantiene / mejora / empeora / mixto. Línea base de ruido: el mismo
+  cálculo entre semanas alternas del año (`interleaved_halves` para el gasto) y bloques de 28 días
+  alternos para el CV. `stability_rule = abc_all` se aplica a las 3 comparaciones con base año
+  anterior. La réplica en Y5 usa Y4 y Y1 como bases.
+- **Razón**: en la exploración (nb 02, 8.1–8.2) el promedio de años previos movió `cv_X` de 14,4 a
+  21,8 y el crecimiento del catálogo (2.019 → 3.049 artículos) encogió la clase A; los datos son
+  pareados, así que el PSI (poblaciones independientes) no corresponde.
+- **Alternativas descartadas**: referencia promediada (FR-016 anterior); PSI; kappa ponderado
+  (el usuario eligió el plano).
+- **Periodo de segmentación**: se elimina (`choose_segment_period`, `segment_candidates`,
+  `segment_criterion`). La 9.1–9.2 del nb 02 mostró que la clase no depende de la época del año y
+  que el criterio comparaba cada periodo con su propio año, con acuerdo inflado.
+
+## R15. Umbral de racha de ceros por artículo (2026-10-29, FR-032)
+
+- **Decisión**: para cada artículo, sobre sus días activos de train entre la primera y la última
+  venta (n días, tasa de ceros p₀), el umbral es el menor k con P(L_n ≥ k) ≤ α, donde L_n es la
+  racha de ceros más larga de n días independientes Bernoulli(p₀). P(L_n < k) se calcula exacto
+  con la recurrencia a_m = Σ_{j=0}^{k−1} p₀^j (1 − p₀) a_{m−j−1} (a_m = 1 para m < k). Las rachas
+  internas de largo ≥ k pasan a NaN en el CV de XYZ y en `share_series`; los ceros de arranque y
+  finales se tratan como en la 6.4–6.5 del nb 02 (`drop_zero_runs`). Diagnóstico: prueba de rachas
+  de Wald–Wolfowitz (venta / sin venta) por artículo. Si p₀ ∈ {0, 1} o n < k, se usa `LONG_RUN` y
+  se registra el motivo. α y `LONG_RUN` viven en `[segmentation]`; los umbrales se congelan.
+- **Razón**: en la exploración, sin las rachas largas Z pasó de 702 a 146 artículos; un umbral
+  fijo de 7 días ignora que cada artículo tiene su propia tasa de ceros.
+- **Límites**: p₀ incluye las rachas que se quieren detectar, así que el umbral es conservador;
+  con p₀ bajo el umbral es corto (≈ 3 días con p₀ = 0,01 y n ≈ 1.450). No hay etiqueta de quiebre
+  para validar el método.
+- **Alternativas descartadas**: `LONG_RUN` fijo para todos; mezcla de geométricas global.
+
+## R16. Backtesting con 13 orígenes en Y4 (2026-10-29, reemplaza el backtest de R8)
+
+- **Decisión**: `backtest_folds = 13` bloques de 28 días sin solapamiento que cubren Y4
+  (d_1214–d_1577). Cada candidato se ajusta una vez con los datos hasta d_1213 y los folds
+  siguientes solo añaden observaciones (`smooth` con parámetros fijos), igual que el test. El
+  elegido se reajusta con todo train antes de congelarse.
+- **Razón**: los 4 folds anteriores caían en feb–may de Y4; con estacionalidad anual (nb 02,
+  9.3–9.4: pico jun–sep, Friedman significativo en 13 de 15 segmentos) la selección no veía el
+  verano, y el test recorre todo Y5.
+- **Costo**: igual número de ajustes que antes (uno por candidato y artículo); solo crecen los
+  suavizados.
