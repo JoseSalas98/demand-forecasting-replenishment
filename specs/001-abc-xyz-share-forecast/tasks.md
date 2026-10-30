@@ -269,8 +269,108 @@ Tarea: "T050 Implementar src/metrics.py"
 ## Phase 9: Convergence
 
 - [ ] T065 CRITICAL: Exigir en `run_train_matrix` (`src/segmentation.py`) que exista `reports/eda_five_years/matrix_five_years.parquet` con fecha de modificación anterior al inicio de la etapa 3, y detenerse si falta, sin leer su contenido; agregar el caso a `src/tests/test_eda.py` per Constitution, Flujo de trabajo (orden obligatorio) y FR-029 (partial)
-- [ ] T066 Registrar con `record_declarations` las claves `segmentation.cv_aggregation`, `segmentation.abc_cuts`, `segmentation.xyz_thresholds` y `segmentation.cv_min_blocks` al inicio de `run_train_matrix`, antes de calcular; mantener `require_declarations` en la etapa 4; agregar la prueba en `src/tests/test_segmentation.py` per FR-012 y FR-015 (partial)
-- [ ] T067 Soportar `cv_aggregation = "segment_period"` en la matriz de train usando los segmentos del periodo congelado, o rechazarlo en `validate_config` (`src/config.py`) con su regla de rango documentada en `contracts/params.md` per FR-012 (partial)
+- [X] T066 Registrar con `record_declarations` las claves `segmentation.cv_aggregation`, `segmentation.abc_cuts`, `segmentation.xyz_thresholds` y `segmentation.cv_min_blocks` al inicio de `run_train_matrix`, antes de calcular; mantener `require_declarations` en la etapa 4; agregar la prueba en `src/tests/test_segmentation.py` per FR-012 y FR-015 (partial) — **2026-10-29:** cubierta por T103 (`TRAIN_DECLARATION_KEYS`) y `test_run_train_matrix_declares_before_freezing`.
+- [X] T067 Soportar `cv_aggregation = "segment_period"` en la matriz de train usando los segmentos del periodo congelado, o rechazarlo en `validate_config` (`src/config.py`) con su regla de rango documentada en `contracts/params.md` per FR-012 (partial) — **2026-10-29:** cubierta por T098: `validate_config` rechaza `segment_period` (constitución 2.0.0).
 - [ ] T068 Implementar en `_selection_unit` (`src/forecasting.py`) un nivel de selección por grupo (por ejemplo, por celda ABC × XYZ de `targets`), con su prueba en `src/tests/test_forecasting.py` per FR-024 (partial)
 - [ ] T069 Corregir en `final_report_tables` (`src/forecasting.py`) la comparación de clases train frente a cinco años para que NaN en ambos lados no cuente como diferencia; agregar la prueba en `src/tests/test_eda.py` per US1/AC3 (partial)
 - [ ] T070 Alinear el tipo de `units` en `load_sales` (`src/data.py`) con T016: dejar float32 y justificarlo por memoria en el docstring, o cambiar a float64 per T016 (contradicts)
+
+## Phase 10: EDA inter e intraanual, ceros y fuerza estacional (US1)
+
+**Metodología acordada (2026-10-27)**:
+- Los cortes se eligen en la base y se aplican al objetivo.
+- ABC usa la regla de % de artículos y % de gasto (A 10–20 % y 60–80 %; B 20–30 % y 20–30 %), pasada a fronteras de participación.
+- XYZ usa `find_cv_cuts` sobre el CV de la base.
+- Interanual: un solo PSI, sobre el % de artículos en los 9 grupos ABC × XYZ, con matrices de transición.
+  - 6A (planteamiento inicial, se conserva para comparar): base expansiva (promedio de los años previos).
+  - 6B (2026-10-28): mismos artículos (activos de Y1 a Y5), sin promedios, base Y1 fija (cambio acumulado) y base año anterior (velocidad del cambio), más mantiene / mejora / empeora (diagonal / debajo / encima de la matriz).
+  - Motivo de la 6B: en la 6A el promedio mueve `cv_X` (14,4 → 21,8) y el crecimiento del catálogo (2.019 → 3.049 artículos activos) encoge la clase A. La dirección se mantiene, pero la magnitud del PSI queda inflada.
+  - Recalcular el CV sobre una ventana de varios años se descarta: no es comparable con el CV anual.
+- Intraanual: periodo frente a su año, solo ABC, más el índice mensual. No le afecta el promedio.
+
+Todo es descriptivo: no congela ni decide nada (FR-029).
+
+- [X] T071 [P] [US1] Pruebas en `src/tests/test_eda.py` para `select_abc_cuts`, `classify_abc_share`, `base_target_classes`, `zero_runs`, `zero_breakdown`, `drop_zero_runs`, `active_stores_by_item`, `seasonal_strength` y `monthly_seasonal_index`
+- [X] T072 [US1] Implementar en `src/segmentation.py` `select_abc_cuts` (grilla de cortes, menor violación y después cercanía al centro) y `classify_abc_share` (fronteras de participación tomadas de la base)
+- [X] T073 [US1] Implementar en `src/stability.py` `base_target_classes`: base (promedio de los conjuntos con actividad completa), cortes ABC y XYZ de la base aplicados al objetivo, estados `both`/`new`/`no_target` y PSI de los grupos con % de artículos
+- [X] T074 [US1] Implementar `zero_runs`, `zero_breakdown` y `drop_zero_runs` (`leading`, `trailing`, `long_run`, `short`) en `src/segmentation.py`, y `active_stores_by_item` en `src/data.py`
+- [X] T075 [US1] Implementar en `src/segmentation.py` `seasonal_strength` y `seasonal_strength_items` (STL; F_S y F_T semanal, m = 7, y anual, m = 52) y `monthly_seasonal_index`
+- [X] T076 [US1] Agregar al nb 02 las secciones 5b (regla ABC frente a los cortes elegidos a mano), 6 (PSI interanual y matrices de transición), 7 (intraanual ABC e índice mensual), 8 (diagnóstico de ceros y sensibilidad del CV) y 9 (fuerza estacional)
+- [X] T077 [US1] Diagnóstico de ceros en el nb 02: el CV alto de 556 de los 702 Z viene de rachas largas (`long_run`) y ~146 Z son erráticos; CY es intermitente (`short`). Los ceros no se tratan (Principio II) y los cortes no se recalculan con el CV limpio: se mantienen los segmentos originales
+- [X] T078 [US1] Agregar al nb 02 la sección 6B (mismos artículos; base Y1 fija y año anterior; PSI, composición, matrices de transición, mantiene / mejora / empeora y cuantiles del CV anual) y renombrar la sección 6 como 6A. Resultado: PSI estable (≤ 0,069), ABC estable, Y5 menos variable (más X, menos Z) y ~50 % de los artículos cambia de grupo cada año
+- [X] T089 [US1] Reemplazar la 7(A) del nb 02 (copia): en lugar de periodo frente a su propio año, comparaciones entre ventanas del mismo largo con los mismos artículos de la 6B: `noise` (semanas impares → pares del periodo), `adjacent` (periodo → siguiente) y `same_last_year`; kappa, Shorrocks, % que mantiene y Spearman; heatmaps año × periodo y Δκ. Funciones `interleaved_halves`, `period_pairs` y `transition_stats` en `src/stability.py`, con pruebas en `src/tests/test_eda.py`. El criterio de la etapa 4 (`max_mean_abc_agreement`) no cambia; queda anotado en la conclusión de la 7
+- [X] T090 [US1] 6B del nb 02, medida de estabilidad: quitar el PSI y sus bandas (quedan solo en la 6A) y usar kappa de Cohen (acuerdo por artículo) y Stuart‑Maxwell (homogeneidad marginal pareada), con el tamaño del cambio en puntos porcentuales por grupo (`max_shift_pp`), por nivel `abc`, `xyz` y `cell` y con las dos bases. Generalizar `transition_stats` (`level`; Stuart‑Maxwell con `statsmodels`) y sus pruebas en `src/tests/test_eda.py`. Motivo: los datos de la 6B son pareados (mismos artículos) y el PSI compara poblaciones independientes
+- [ ] ~~T091 [US1] 6B del nb 02, línea base de ruido como en la 7: dentro del mismo año, semanas alternadas (gasto) y bloques de 28 días alternados (CV); leer el "~50 % cambia de grupo por año" contra esa base. Límite: las mitades tienen menos bloques, así que la base es conservadora~~ — **2026-10-29:** obsoleta en el nb 02; la línea base de ruido pasa a train (T105).
+- [X] T092 [US1] 6B del nb 02: mantiene / mejora / empeora por ABC y por XYZ por separado, no sobre el orden AX…CZ (que cuenta AZ → BX como empeora) — **2026-10-29:** también en ABC × XYZ, por dimensión (mejora, empeora o `mixto`), y matrices de transición en los tres niveles
+- [X] T093 [US1] 6B del nb 02, declarar en el markdown: Stuart‑Maxwell con n = 1,682 detecta cambios mínimos y se lee con `max_shift_pp`; el kappa no está ponderado aunque ABC y XYZ son ordinales (decidir si se reporta también el ponderado) — **Decisión (2026-10-29):** solo kappa plano; el panel cubre solo los artículos activos los 5 años
+- [X] T094 [US1] Reescribir la conclusión de la 6B con las medidas de T090–T093
+- [X] T095 [US1] 7(E) del nb 02 (copia): índice estacional clásico (razón a media móvil 2×12) con `classical_seasonal_index` en `src/segmentation.py`, sobre la serie agregada de cada segmento ABC, XYZ y ABC × XYZ; solo artículos activos todos los días de Y1–Y5 (los lanzamientos se concentran en enero–abril y se confundirían con estacionalidad); unidades diarias promedio por mes calendario completo; mes típico = promedio de los ratios entre años; normalizado a suma 12. Pruebas en `src/tests/test_eda.py`. Motivo: los paneles de la 7(D) son ratios de un solo año contra la media del año, no un índice estacional
+- [X] T096 [US1] nb 02 (copia): prueba de Friedman sobre los ratios de la 7(E) con `friedman_seasonality` (bloques = años con los 12 ratios, p-valor por permutación, Kendall W, Holm sobre las 15 pruebas) y conclusión de la 7(E); se borra la 7(D) (`monthly_seasonal_index` sigue en el nb 02 original). Pruebas en `src/tests/test_eda.py`
+- [X] T097 [US1] nb 02 (copia), debajo del diagnóstico de ceros: grupos ABC × XYZ crudos frente a limpios (`xyz_clean`, sin ceros `leading`, `trailing` y `long_run`, mismos umbrales del CV): artículos y gasto por grupo y matrices de transición XYZ y ABC × XYZ. Z pasa de 702 a 146 y X de 832 a 1.453; ABC no cambia. Hallazgo, sin efecto sobre la clasificación
+- [ ] T079 [US1] Revisar las secciones 7 (intraanual) y 9 (fuerza estacional) del nb 02 y escribir su lectura
+- [ ] T080 [US1] Escribir las conclusiones generales del nb 02
+- [ ] T081 [US1] Limpiar el nb 02: quitar o marcar como exploración descartada las celdas del recálculo de cortes con el CV limpio y quitar las celdas `raise Exception("Detener")`; pasar los cambios de `02_eda_five_years copy.ipynb` a `02_eda_five_years.ipynb` y borrar la copia
+- [ ] T082 [US1] Ejecutar el nb 02 completo y generar `reports/eda_five_years/` (incluido `matrix_five_years.parquet`, que exige T065 antes de la etapa 3)
+- [X] T083 Decidir si la referencia de estabilidad de FR-016 (promedio de los años previos) se mantiene. **Decisión (2026-10-28):** se reemplaza por la base del año anterior, con los mismos artículos y sin promedios (Y2 frente a Y1, Y3 frente a Y2, Y4 frente a Y3), como en la 6B del nb 02. Motivo: en el nb 02 el promedio infló el PSI (6A frente a 6B)
+
+**Decisiones para train (2026-10-28)**, a ejecutar antes del nb 03:
+- Cortes ABC: la regla de la sección 5b del nb 02 (`select_abc_cuts`: A 10–20 % de los artículos y 60–80 % del gasto; B 20–30 % y 20–30 %; paso 0,01).
+- Cortes XYZ: `find_cv_cuts` con gasto (`n_cuts = 2`, `min_share = 0.20`, `resolution = 100`).
+- Estabilidad (nb 04): base = año anterior, mismos artículos, sin promedios (T083).
+- Demanda errática (AZ): si no le gana al seasonal naive, se reporta en el informe; la clasificación SBC queda para el Entregable 2 (fuera de alcance), sin cambiar FR-023.
+
+- [X] T084 Registrar en `research.md` (R5) el método de cortes elegido para train (regla 5b para ABC y `find_cv_cuts` con gasto para XYZ) y su criterio, declarado antes de ejecutarlo — **2026-10-29:** hecho en `research.md` R14 (y R5 sigue como punto de partida).
+- [ ] ~~T085 Agregar a `contracts/params.md` y `src/config/params.toml` las claves de la regla ABC (`item_bounds`, `spend_bounds`, `step`) y de `find_cv_cuts` (`n_cuts`, `min_share`, `resolution`), con valor por defecto, regla de rango en `validate_config` (`src/config.py`) y fila en `params_history.csv` (Principio III)~~ — **2026-10-29:** reemplazada por T098.
+- [ ] ~~T086 En `run_train_matrix` y el nb 03, elegir los cortes ABC con `select_abc_cuts` y los umbrales XYZ con `find_cv_cuts` sobre la matriz de train (≤ d_1577), registrarlos con `record_declarations` antes de calcular (ver T066) y congelarlos en `params.toml` con su fila de historial~~ — **2026-10-29:** reemplazada por T103.
+- [X] T087 Aclarar en `spec.md` (Clarifications y FR-016) y en `research.md` (R6) la nueva referencia de estabilidad: año anterior, mismos artículos (activos todo Y1–Y4), sin promedios. Revisar si FR-030 (réplica: Y5 frente al promedio de Y1–Y4) cambia igual a Y5 frente a Y4. Subir la `version` de la spec — **2026-10-29:** hecho en `spec.md` (Session 2026-10-29, FR-016) y `research.md` R14.
+- [ ] ~~T088 Cambiar `reference_classes` (`src/stability.py`) y su uso en el nb 04 para la base del año anterior con los mismos artículos; actualizar `src/tests/test_stability.py` y revisar que las 4 reglas de `STABILITY_RULES` siguen recibiendo 3 comparaciones **Nota (2026-10-28):** `stability_measures` también usa el PSI sobre datos pareados; pasar a las mismas medidas que la T090.~~ — **2026-10-29:** obsoleta, reemplazada por T104–T106 (bases año anterior y Y1 con `base_target_classes`).
+
+---
+
+## Phase 11: Alineación de las etapas 3–7 con la constitución 2.0.0 (2026-10-29)
+
+**Objetivo**: que train no repita los supuestos que el nb 02 descartó. Fuentes: constitución 2.0.0,
+spec (Session 2026-10-29; FR-013, FR-015–FR-018, FR-020, FR-024, FR-030, FR-032), research R14–R16,
+`contracts/params.md` y `contracts/artifacts.md`. No hay artefactos congelados: no se repite nada.
+
+**Prueba independiente**: `uv run pytest src/tests -q` en verde; los notebooks 03–06 corren sobre
+datos sintéticos (`PROJECT_ROOT`) sin leer días > 1577 salvo el 05, y producen los artefactos con
+las columnas de `contracts/artifacts.md`.
+
+### Configuración
+
+- [X] T098 Actualizar `src/config/params.toml`, `src/config/params_history.csv` y `src/config.py` según `contracts/params.md`: añadir en `[segmentation]` `abc_rule_item_bounds = [[0.10, 0.20], [0.20, 0.30]]`, `abc_rule_spend_bounds = [[0.60, 0.80], [0.20, 0.30]]`, `abc_rule_step = 0.01`, `cv_cut_min_share = 0.20`, `cv_cut_resolution = 100`, `zero_alpha = 0.01`, `long_run = 7`; quitar `segment_candidates`, `segment_criterion`, `agreement_min`, `psi_bands`, `psi_epsilon` de `[stability]` y `segment_period` de los valores de `cv_aggregation`; `backtest_folds = 13`. Reglas de rango: "`0 < zero_alpha < 1`; `long_run ≥ 1` entero", "`0 < cv_cut_min_share < 0.5`; `cv_cut_resolution ≥ 10`", intervalos de la regla ABC con `0 ≤ lo < hi ≤ 1`, "`backtest_folds × horizon` ≤ días de Y4". Una fila por cambio en el historial con motivo "constitución 2.0.0". Actualizar `src/tests/test_config.py`
+- [X] T099 [P] Hacer opcional el PSI en `base_target_classes` (`src/stability.py`): `psi_cfg=None` no calcula `psi` ni `psi_band`; el nb 02 (8.1) pasa sus valores locales (`{"psi_epsilon": 1e-4, "psi_bands": [0.10, 0.25]}`) para conservar la comparación histórica
+
+### Umbral de rachas de ceros (FR-032, R15)
+
+- [X] T100 [P] [US2] Pruebas en `src/tests/test_segmentation.py`: `longest_run_threshold(p0, n, alpha)` coincide con una simulación de Monte Carlo (P(L_n ≥ k) ≤ α y P(L_n ≥ k − 1) > α); con p₀ = 0,01 y n = 1.450 da k ≈ 3; p₀ ∈ {0, 1} o n < k devuelve `None`; `zero_run_thresholds` usa `long_run` y registra `reason` en esos casos; `mask_zero_runs` pone NaN solo en rachas internas ≥ umbral y en los ceros de arranque y finales, y no toca el prelanzamiento ni los ceros sueltos
+- [X] T101 [US2] Implementar en `src/segmentation.py` `longest_run_threshold(p0, n, alpha) -> int | None` (recurrencia exacta a_m = Σ_{j=0}^{k−1} p₀^j (1 − p₀) a_{m−j−1}) y `zero_run_thresholds(agg, start_d, end_d, alpha, long_run) -> pd.DataFrame` con columnas `item_id, n_days, p0, threshold, source, reason, ww_z, ww_pvalue` (n y p₀ sobre los días activos entre la primera y la última venta; Wald–Wolfowitz con `statsmodels.sandbox.stats.runs.runstest_1samp`). Justificación de abstracción (b): se usa en el CV de XYZ y en la serie de participación
+- [X] T102 [US2] Implementar en `src/segmentation.py` `mask_zero_runs(units, item_ids, thresholds) -> np.ndarray` reutilizando `zero_runs` y `drop_zero_runs`, y usar las unidades enmascaradas en el CV de `build_matrix` (los bloques de 28 días con algún día NaN se descartan, como hoy)
+
+### Matriz de train (US2)
+
+- [X] T103 [US2] En `run_train_matrix` (`src/segmentation.py`) y `notebooks/03_abc_xyz_train.ipynb`: registrar las declaraciones de la regla ABC, `find_cv_cuts`, `zero_alpha` y `long_run` antes de calcular (`record_declarations`); estimar y congelar `zero_thresholds` (`data/processed/zero_thresholds.parquet`); elegir los cortes ABC con `select_abc_cuts` y los umbrales XYZ con `find_cv_cuts` sobre train (≤ d_1577) con el CV enmascarado; congelar `matrix_train`. El nb 03 muestra la distribución de umbrales, el % de artículos con agrupamiento según Wald–Wolfowitz, los cortes elegidos y la comparación crudo frente a enmascarado. Actualizar `src/tests/test_segmentation.py`
+
+### Estabilidad y lista objetivo (US3)
+
+- [X] T104 [US3] Reescribir `run_stability_stage` (`src/stability.py`): para t ∈ {Y2, Y3, Y4}, `base_target_classes` con base año anterior y con base Y1 (mismos artículos, cortes con la regla ABC y `find_cv_cuts` de la config, CV enmascarado); `transition_stats` en `abc`, `xyz` y `cell`; la matriz global de train frente a cada año con las mismas medidas. Quitar `choose_segment_period`, `period_matrices` del flujo, `reference_classes` y `stability_measures`; `STABILITY_DECLARATION_KEYS` sin claves de periodo ni PSI. `build_item_stability` usa las 3 comparaciones con base año anterior (`same_abc`, `same_xyz`, `same_cell`) y las 4 reglas siguen recibiendo 3 comparaciones. `stability.parquet` con las columnas de `contracts/artifacts.md`; `segmentation_params.json` sin periodo y con cortes elegidos, `zero_alpha` y `long_run`
+- [X] T105 [US3] Línea base de ruido en `src/stability.py`: para cada año de train, `interleaved_halves` (semanas impares → pares) para el gasto y una función `alternating_block_cv` (bloques de 28 días impares → pares) para el CV; medir con `transition_stats` y guardar con `base_kind = "noise"` en `stability.parquet`
+- [X] T106 [P] [US3] Actualizar `src/tests/test_stability.py`: comparación con base año anterior y Y1 sobre datos sintéticos (mismos artículos, cortes de la base por participación), línea base de ruido, reglas con 3 comparaciones, lista objetivo solo A estables, ausencia de claves de periodo
+- [X] T107 [US3] Actualizar `notebooks/04_stability_target_list.ipynb`: tabla de medidas por base, nivel y año (como la 8.2 del nb 02), matrices de transición en los tres niveles, línea base de ruido, regla `abc_all`, lista objetivo con tratamiento; markdown con los límites (Stuart–Maxwell sensible con n grande, kappa plano)
+
+### Réplica en el año 5 (US4)
+
+- [X] T108 [US4] Cambiar `replicate_year5` y `run_replication` (`src/stability.py`) y `notebooks/05_year5_replication.ipynb`: bases Y4 y Y1 con `base_target_classes` usando los cortes, umbrales y `zero_thresholds` congelados (no recalculados); medidas de `transition_stats`; `stability_y5.parquet` con las columnas de `stability.parquet`; por producto objetivo, si mantiene clase y celda. Actualizar `src/tests/test_replication.py`
+
+### Pronóstico (US5)
+
+- [X] T109 [US5] En `src/forecasting.py`: `share_series` recibe `zero_thresholds` congelado y pone NaN en las rachas enmascaradas (`mask_zero_runs`); `fold_starts` devuelve 13 orígenes cada 28 días en d_1214–d_1577; cada candidato se ajusta una vez con datos ≤ d_1213 y los folds se suavizan con parámetros fijos (R16). Actualizar `src/tests/test_forecasting.py` (folds dentro de d_1214–d_1577, NaN en las rachas, ajuste antes del primer fold)
+- [X] T110 [US5] Actualizar `notebooks/06_backtesting.ipynb`: cargar `zero_thresholds`, mostrar el RMSSE por fold (13) y por mes para ver el ciclo anual
+
+### Cierre
+
+- [X] T111 Ejecutar `uv run pytest src/tests -q` y los notebooks 03–06 sobre los datos sintéticos (`PROJECT_ROOT`); revisar que `quickstart.md` (etapas 3–6) se cumpla
+- [X] T112 [P] Actualizar `notebooks/02_eda_five_years copy.ipynb` (8.1) para pasar `psi_cfg` local (T099) y verificar que corre completo
+
+**Dependencias**: T098 → T099–T103 → T104–T107 → T108 → T109–T110 → T111. T100 y T106 pueden escribirse en paralelo con sus implementaciones. T112 depende de T099.

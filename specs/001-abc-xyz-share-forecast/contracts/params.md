@@ -24,16 +24,18 @@ horizon = 28
 usage_period = "computation_set"
 abc_cuts = [0.80, 0.95]
 xyz_thresholds = [10.0, 25.0]        # porcentaje
-cv_aggregation = "block28"           # block28 | daily | weekly | segment_period
+cv_aggregation = "block28"           # block28 | daily | weekly
 cv_min_blocks = 2
+abc_rule_item_bounds = [[0.10, 0.20], [0.20, 0.30]]    # % de artículos A y B
+abc_rule_spend_bounds = [[0.60, 0.80], [0.20, 0.30]]   # % de gasto A y B
+abc_rule_step = 0.01
+cv_cut_min_share = 0.20              # find_cv_cuts: mínimo de artículos por segmento
+cv_cut_resolution = 100
+zero_alpha = 0.01                    # FR-032: P(racha más larga ≥ k) ≤ α
+long_run = 7                         # respaldo si el umbral no se puede estimar
 
 [stability]
-segment_candidates = ["quarter", "four_month"]
-segment_criterion = "max_mean_abc_agreement"
 min_active_days_year = 364
-agreement_min = 0.80
-psi_bands = [0.10, 0.25]
-psi_epsilon = 1e-4
 stability_rule = "abc_all"           # abc_all | abc_xyz_all | cell_majority | a_every_year
 stability_rule_criterion = "fixed"
 
@@ -45,7 +47,7 @@ AZ = "promotion_priority"
 [forecast]                           # se declara antes de la réplica en el año 5; cambiarlo después exige nueva version
 selection_level = "item"             # etiquetas definidas por el analista durante la experimentación
 subset_size = "all"                  # "all" o entero N (los N primeros por gasto en train)
-backtest_folds = 4
+backtest_folds = 13                  # 13 × 28 días = Y4 completo (R16)
 snaive_m = 7
 ma_windows = [7, 14, 28, 56]
 arima_p = [0, 1, 2]
@@ -64,12 +66,13 @@ weight_window = [1550, 1577]
 |---|---|
 | Cortes ABC | `0 < abc_cuts[0] < abc_cuts[1] < 1` |
 | Umbrales XYZ | `0 ≤ x < z` |
-| PSI | `psi_bands` ascendente, todos ≥ 0, `psi_epsilon > 0` |
-| Acuerdo | `0 < agreement_min ≤ 1` |
+| Regla ABC | Intervalos `[lo, hi]` con `0 ≤ lo < hi ≤ 1`; `0 < abc_rule_step < 1` |
+| Ceros | `0 < zero_alpha < 1`; `long_run ≥ 1` entero |
+| Cortes CV | `0 < cv_cut_min_share < 0.5`; `cv_cut_resolution ≥ 10` |
 | Partición | Bloques contiguos y sin solapamiento. Todo día de train < `test_days[0]`. Longitud de `test_days` = `test_origins × horizon`. |
-| Enumeraciones | `cv_aggregation`, `stability_rule` y `segment_candidates` deben ser nombres conocidos |
+| Enumeraciones | `cv_aggregation` y `stability_rule` deben ser nombres conocidos |
 | Mapa de tratamientos | Los valores son cadenas no vacías |
-| Pronóstico | Ventanas y órdenes son enteros no negativos, `backtest_folds ≥ 1` |
+| Pronóstico | Ventanas y órdenes son enteros no negativos, `backtest_folds × horizon` ≤ días de Y4 |
 
 ## `src/config/params_history.csv`
 

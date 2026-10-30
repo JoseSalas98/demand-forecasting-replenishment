@@ -31,16 +31,16 @@ Casos clave:
 
 ## Ejecución por etapas (correr los notebooks en orden)
 
-El orden es obligatorio (constitución v1.1.0, research R13).
+El orden es obligatorio (constitución 2.0.0, research R13–R16).
 
 | # | Notebook | Resultado esperado | Verificaciones |
 |---|---|---|---|
 | 1 | `01_data_validation` | Arreglos intermedios, `rejections.parquet`, `launch.parquet` | Calendario continuo. Cada rechazo tiene motivo, fuente y fila (SC-002). |
 | 2 | `02_eda_five_years` | `reports/eda_five_years/` | Solo descriptivo (Y1–Y5). Ninguna etapa posterior lee esta carpeta (US1-2). |
-| 3 | `03_abc_xyz_train` | `matrix_train.parquet` congelado | El 100 % de los artículos activos tiene clase o motivo de exclusión (SC-001). Revisión manual de ≥ 10 artículos (SC-003). Solo se cargan días ≤ 1577. Diferencias con el EDA reportadas como hallazgo (US1-3). |
-| 4 | `04_stability_target_list` | `targets.parquet` y `segmentation_params.json` congelados | Declaraciones registradas antes de la ejecución. Comparaciones Y2/Y1, Y3/prom(Y1,Y2), Y4/prom(Y1–Y3). Todo objetivo es A, estable y con tratamiento. Ningún día de Y5 se toca (FR-021). |
+| 3 | `03_abc_xyz_train` | `zero_thresholds.parquet`, `train_cuts.json` y `matrix_train.parquet` congelados | El 100 % de los artículos activos tiene clase o motivo de exclusión (SC-001). Revisión manual de ≥ 10 artículos (SC-003). Solo se cargan días ≤ 1577. Cortes elegidos con la regla ABC y `find_cv_cuts` sobre train. `zero_thresholds` congelado con Wald–Wolfowitz como diagnóstico. Diferencias con el EDA reportadas como hallazgo (US1-3). |
+| 4 | `04_stability_target_list` | `targets.parquet` y `segmentation_params.json` congelados | Declaraciones registradas antes de la ejecución. Comparaciones Yt−1 → Yt y Y1 → Yt con los mismos artículos; kappa, Stuart–Maxwell y `max_shift_pp` en ABC, XYZ y ABC × XYZ, con línea base de ruido. Sin PSI ni periodo de segmentación. Todo objetivo es A, estable y con tratamiento. Ningún día de Y5 se toca (FR-021). |
 | 5 | `05_year5_replication` | `matrix_y5`, `stability_y5`, `year5_replication` congelados | `[forecast]` declarado antes de leer Y5. Parámetros congelados aplicados sin cambios. Réplica del 100 % de los objetivos. El hash de `targets` no cambia (US4). |
-| 6 | `06_backtesting` | `frozen_models.json`, `backtest_scores.parquet` | Declaraciones de `[forecast]` anteriores a `matrix_y5` e iguales a la config. Folds dentro de d_1466–d_1577. Fallos registrados. |
+| 6 | `06_backtesting` | `frozen_models.json`, `backtest_scores.parquet` | Declaraciones de `[forecast]` anteriores a `matrix_y5` e iguales a la config. 13 folds de 28 días en d_1214–d_1577, un ajuste por candidato con datos ≤ d_1213. Rachas de ceros ≥ umbral como NaN en la serie. Fallos registrados. |
 | 7 | `07_test_evaluation` | `evaluation.parquet`, entrada en el ledger | 13 orígenes × 28 días. Parámetros idénticos al archivo congelado. WRMSSE del elegido < seasonal naive (SC-006). Repetir con el mismo `model_id` detiene el proceso (SC-007). |
 | 8 | `08_final_report` | `reports/final_report.*` | Clase, participación en gasto, tratamiento y pronóstico de cada objetivo (SC-008). Advertencia sobre backtesting y sesgo de selección. WAPE/RMSE. Réplica en Y5 del 100 % de los objetivos (SC-009). |
 
