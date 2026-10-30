@@ -1,5 +1,34 @@
 <!--
 Sync Impact Report
+- Version change: 1.2.0 → 2.0.0 (MAJOR, 2026-10-29)
+- Motivo del MAJOR: se redefinen reglas del Principio VI (NO NEGOCIABLE) de forma incompatible
+  con la versión anterior: cambian las comparaciones de estabilidad y se elimina la elección del
+  periodo de segmentación.
+- Modified principles:
+  - II. Reglas de dominio: los ceros internos en rachas estadísticamente improbables (criterio del
+    Principio VI) se tratan como no observados (NaN) en el CV y en la serie de pronóstico, sin
+    afirmar que sean quiebres. Los demás ceros siguen siendo ambiguos y se conservan.
+  - III. Parámetros configurables: sale el periodo de segmentación; entran `LONG_RUN` (respaldo) y
+    el α de la prueba de rachas.
+  - V. Fuente de la verdad: sale el periodo de segmentación de lo que se serializa; entran los
+    umbrales de racha por artículo.
+  - VI. Método y congelamiento: (1) estabilidad con la base del año anterior (Yt−1 → Yt) y con Y1
+    fija, mismos artículos, cortes elegidos en la base y aplicados al objetivo por participación;
+    se elimina la comparación contra el promedio de años previos. (2) Medidas pareadas: kappa de
+    Cohen plano, Stuart–Maxwell y cambio en puntos porcentuales; sin PSI sobre datos pareados.
+    (3) Se elimina la elección del periodo de segmentación. (4) Umbral de rachas de ceros por
+    artículo estimado solo con train. (5) Backtesting con 13 orígenes cada 28 días en el año 4.
+    (6) La exploración puede orientar el método (qué medidas encajan), nunca los valores.
+- Removed sections: ninguna (se eliminan reglas dentro de VI).
+- Motivo: lo aprendido en la exploración (nb 02): el promedio de años previos sesga los cortes y
+  el crecimiento del catálogo diluye la clase A; los datos de estabilidad son pareados; la clase
+  ABC no depende de la época del año; los ceros estructurales inflan el CV (Z pasa de 702 a 146
+  sin ellos); hay estacionalidad anual que 4 folds de fin de año no cubren.
+- Impacto sobre artefactos congelados: ninguno (todavía no hay artefactos congelados).
+- Artefactos por actualizar: spec.md (FR-015 a FR-019, FR-023/24, FR-030 y supuestos),
+  research.md (folds, R5), data-model.md, contracts/, tasks.md y params.toml.
+
+Historial 1.2.0
 - Version change: 1.1.0 → 1.2.0 (MINOR, 2026-10-27)
 - Modified principles:
   - III. Parámetros configurables: los cortes ABC y los umbrales XYZ son parámetros experimentales;
@@ -82,9 +111,14 @@ reposición, algo que esta etapa no valida.
   entrenamiento, la evaluación y los cálculos de uso, gasto y CV. NO se tratan como cero.
 - **Ceros en periodo activo:** son ambiguos (quiebre de stock o baja demanda). NO DEBEN
   interpretarse como quiebre sin evidencia externa.
+- **Rachas improbables de ceros:** una racha interna de ceros de largo igual o mayor que el
+  umbral del artículo (Principio VI) se trata como **no observada** (NaN) en el CV de XYZ y en la
+  serie de pronóstico. No se afirma su causa: se excluye porque es improbable como demanda de días
+  independientes. El resto de los ceros se conserva como demanda observada.
 
 **Razón:** el gasto con precio por tienda-semana y la exclusión del prelanzamiento evitan sesgos
-en ABC y en el CV que alterarían la clasificación.
+en ABC y en el CV que alterarían la clasificación. Las rachas improbables de ceros inflan el CV y
+enseñan al modelo una demanda nula que no se observó.
 
 ### III. Estilo de código, parámetros y abstracciones
 
@@ -95,7 +129,7 @@ en ABC y en el CV que alterarían la clasificación.
   descripción, parámetros con tipo y breve descripción, y retorno.
 - Los comentarios DEBEN explicar el porqué de una decisión, no repetir lo que hace el código.
 - **Parámetros configurables:** todos los cortes, umbrales y periodos (cortes ABC, umbrales XYZ,
-  periodo de uso, periodo de segmentación, candidatos, umbrales de estabilidad) DEBEN vivir en
+  periodo de uso, candidatos, α de la prueba de rachas y `LONG_RUN` de respaldo) DEBEN vivir en
   un único archivo de configuración. Cada parámetro DEBE tener un valor por defecto documentado.
   Ningún valor queda fijo en el código.
 - Los cortes ABC y los umbrales XYZ son parámetros experimentales: su valor por defecto es un punto
@@ -140,8 +174,8 @@ sin dejar rastro.
 - Los archivos originales de M5 son inmutables. Las transformaciones DEBEN producir archivos
   nuevos.
 - El archivo de configuración y su historial de cambios son la referencia para los parámetros.
-- Los cortes XYZ, la asignación ABC, el periodo de segmentación, la lista de productos objetivo
-  y su tratamiento se serializan una vez y se cargan en memoria. NO se recalculan.
+- Los cortes XYZ, la asignación ABC, los umbrales de racha por artículo, la lista de productos
+  objetivo y su tratamiento se serializan una vez y se cargan en memoria. NO se recalculan.
 - La lista de productos objetivo congelada es la única fuente para el modelado y la evaluación
   en test.
 - El repositorio es la referencia para la especificación, la constitución y el plan.
@@ -157,21 +191,35 @@ sin dejar rastro.
   gasto, XYZ, distribuciones, proporción de ceros, media frente a mediana, y estabilidad anual y
   global solo como descripción, además de la exploración inter e intraanual. Es una línea base
   para saber qué esperar al explorar por años. NO selecciona productos, cortes, periodos ni
-  partición, y NO informa ninguna decisión del modelo; probar cortes aquí es solo exploración. Sus diferencias con la matriz de train se reportan como
-  hallazgo y no corrigen la matriz congelada.
-- **Estabilidad estacional:** todo lo que influya en una decisión DEBE calcularse solo con train
-  (años 1 a 4). Comparaciones: año 2 contra año 1; año 3 contra el promedio de años 1 y 2; año 4
-  contra el promedio de años 1 a 3. El año 5 NO entra en ninguna comparación de este análisis.
-- El criterio para elegir entre periodos de segmentación candidatos DEBE declararse antes de
-  ejecutar el análisis.
+  partición, y NO informa ninguna decisión del modelo; probar cortes aquí es solo exploración.
+  Sus diferencias con la matriz de train se reportan como hallazgo y no corrigen la matriz
+  congelada. Lo que sí puede orientar es el **método** (qué medidas encajan con los datos); los
+  valores se calculan de nuevo en train.
+- **Estabilidad:** todo lo que influya en una decisión DEBE calcularse solo con train (años 1 a
+  4). Dos bases: el año anterior (año t − 1 → año t) y el año 1 fijo (año 1 → año t). Se comparan
+  los mismos artículos (activos todos los días de los años comparados), sin promediar años. Los
+  cortes se eligen en la base y se aplican al objetivo por participación en el gasto. El año 5 NO
+  entra en ninguna comparación de este análisis.
+- **Medidas pareadas:** como base y objetivo son los mismos artículos, la estabilidad se mide con
+  kappa de Cohen plano (acuerdo por artículo), Stuart–Maxwell (cambio en el % de artículos por
+  clase) y el mayor cambio en puntos porcentuales. El PSI NO se usa sobre datos pareados.
+- **Sin periodo de segmentación:** la clase se define por año; NO se elige un periodo dentro del
+  año (trimestre o cuatrimestre).
+- **Umbral de rachas de ceros:** se estima por artículo solo con train. Es el menor k tal que la
+  probabilidad de que la racha de ceros más larga sea ≥ k, bajo días independientes con la tasa de
+  ceros observada del artículo, sea ≤ α (α declarado; por defecto 0,01). La prueba de rachas de
+  Wald–Wolfowitz por artículo se reporta como diagnóstico. Si el umbral no se puede estimar, se usa
+  `LONG_RUN` (por defecto 7).
+- **Backtesting:** 13 orígenes cada 28 días repartidos en el año 4, igual que el test, para que la
+  selección de modelos cubra todo el ciclo anual.
 - **Réplica en el año 5:** una vez congelados la lista objetivo y su tratamiento, y declarados
   los candidatos de pronóstico y el nivel de selección del modelo, se replica sobre el año 5 la
   matriz ABC × XYZ y la estabilidad con los cortes, umbrales y agregación congelados. Es solo
   diagnóstico: NO modifica la lista, el tratamiento ni los candidatos declarados, y ninguna etapa
   de selección de modelos la lee. Cambiar un candidato declarado después de la réplica exige una
   nueva versión.
-- Cualquier selección (línea base, órdenes ARIMA/SARIMA, periodo de segmentación, subconjunto,
-  cortes ABC y XYZ, lista de productos objetivo) DEBE hacerse solo con backtesting o análisis
+- Cualquier selección (línea base, órdenes ARIMA/SARIMA, subconjunto, cortes ABC y XYZ, umbrales
+  de racha, lista de productos objetivo) DEBE hacerse solo con backtesting o análisis
   interno dentro del train.
 - El método para elegir cortes ABC y XYZ no se fija de antemano: puede ser determinista (valores
   fijos, sensibilidad, percentiles) o algorítmico (por ejemplo, una búsqueda de cortes sobre la
@@ -236,4 +284,4 @@ MAPE no está definido o se distorsiona.
   la centralización de parámetros, el registro de rechazos, el aislamiento del test y la
   justificación escrita de cada abstracción.
 
-**Version**: 1.2.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-10-27
+**Version**: 2.0.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-10-29
