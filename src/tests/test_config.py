@@ -18,15 +18,20 @@ def test_default_config_is_valid(tiny_cfg):
         (("segmentation", "abc_cuts"), [0.80, 1.0]),
         (("segmentation", "xyz_thresholds"), [25.0, 10.0]),
         (("segmentation", "xyz_thresholds"), [-1.0, 25.0]),
-        (("stability", "psi_bands"), [0.25, 0.10]),
-        (("stability", "psi_bands"), [-0.1, 0.25]),
-        (("stability", "psi_epsilon"), 0.0),
-        (("stability", "agreement_min"), 0.0),
-        (("stability", "agreement_min"), 1.5),
+        (("segmentation", "abc_rule_item_bounds"), [[0.20, 0.10], [0.20, 0.30]]),
+        (("segmentation", "abc_rule_spend_bounds"), [[0.60, 1.20], [0.20, 0.30]]),
+        (("segmentation", "abc_rule_step"), 0.0),
+        (("segmentation", "zero_alpha"), 0.0),
+        (("segmentation", "zero_alpha"), 1.0),
+        (("segmentation", "long_run"), 0),
+        (("segmentation", "long_run"), 7.5),
+        (("segmentation", "cv_cut_min_share"), 0.5),
+        (("segmentation", "cv_cut_resolution"), 5),
         (("segmentation", "cv_aggregation"), "monthly"),
+        (("segmentation", "cv_aggregation"), "segment_period"),
         (("stability", "stability_rule"), "anything"),
-        (("stability", "segment_candidates"), ["quarter", "semester"]),
         (("forecast", "backtest_folds"), 0),
+        (("forecast", "backtest_folds"), 3),
         (("forecast", "ma_windows"), [7, -1]),
         (("forecast", "arima_p"), [0.5]),
         (("split", "test_origins"), 3),
@@ -56,8 +61,8 @@ def test_empty_treatment_stops(tiny_cfg):
 
 def test_missing_key_stops(tiny_cfg):
     cfg = copy.deepcopy(tiny_cfg)
-    del cfg["stability"]["psi_epsilon"]
-    with pytest.raises(ValueError, match="psi_epsilon"):
+    del cfg["segmentation"]["zero_alpha"]
+    with pytest.raises(ValueError, match="zero_alpha"):
         validate_config(cfg)
 
 

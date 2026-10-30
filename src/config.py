@@ -25,12 +25,14 @@ REQUIRED_KEYS = [
     "segmentation.xyz_thresholds",
     "segmentation.cv_aggregation",
     "segmentation.cv_min_blocks",
-    "stability.segment_candidates",
-    "stability.segment_criterion",
+    "segmentation.abc_rule_item_bounds",
+    "segmentation.abc_rule_spend_bounds",
+    "segmentation.abc_rule_step",
+    "segmentation.cv_cut_min_share",
+    "segmentation.cv_cut_resolution",
+    "segmentation.zero_alpha",
+    "segmentation.long_run",
     "stability.min_active_days_year",
-    "stability.agreement_min",
-    "stability.psi_bands",
-    "stability.psi_epsilon",
     "stability.stability_rule",
     "stability.stability_rule_criterion",
     "treatment_map",
@@ -47,10 +49,8 @@ REQUIRED_KEYS = [
     "metrics.weight_window",
 ]
 
-CV_AGGREGATIONS = {"block28", "daily", "weekly", "segment_period"}
+CV_AGGREGATIONS = {"block28", "daily", "weekly"}
 STABILITY_RULE_NAMES = {"abc_all", "abc_xyz_all", "cell_majority", "a_every_year"}
-SEGMENT_KINDS = {"quarter", "four_month"}
-SEGMENT_CRITERIA = {"max_mean_abc_agreement"}
 RULE_CRITERIA = {"fixed"}
 USAGE_PERIODS = {"computation_set"}
 
@@ -177,24 +177,30 @@ def validate_config(cfg: dict) -> None:
     xyz = seg["xyz_thresholds"]
     if not (len(xyz) == 2 and 0 <= xyz[0] < xyz[1]):
         _fail("xyz_thresholds", "0 ≤ x < z")
-    bands = stab["psi_bands"]
-    if not (len(bands) == 2 and 0 <= bands[0] < bands[1]):
-        _fail("psi", "psi_bands ascendente, todos ≥ 0")
-    if not stab["psi_epsilon"] > 0:
-        _fail("psi", "psi_epsilon > 0")
-    if not 0 < stab["agreement_min"] <= 1:
-        _fail("agreement", "0 < agreement_min ≤ 1")
+    for key in ("abc_rule_item_bounds", "abc_rule_spend_bounds"):
+        pairs = seg[key]
+        if not (
+            isinstance(pairs, list)
+            and len(pairs) == 2
+            and all(isinstance(b, list) and len(b) == 2 and 0 <= b[0] < b[1] <= 1 for b in pairs)
+        ):
+            _fail("abc_rule", f"{key}: dos intervalos [lo, hi] con 0 ≤ lo < hi ≤ 1")
+    if not 0 < seg["abc_rule_step"] < 1:
+        _fail("abc_rule", "0 < abc_rule_step < 1")
+    if not 0 < seg["zero_alpha"] < 1:
+        _fail("zeros", "0 < zero_alpha < 1")
+    if not (_is_int(seg["long_run"]) and seg["long_run"] >= 1):
+        _fail("zeros", "long_run debe ser entero ≥ 1")
+    if not 0 < seg["cv_cut_min_share"] < 0.5:
+        _fail("cv_cuts", "0 < cv_cut_min_share < 0.5")
+    if not (_is_int(seg["cv_cut_resolution"]) and seg["cv_cut_resolution"] >= 10):
+        _fail("cv_cuts", "cv_cut_resolution debe ser entero ≥ 10")
     _validate_split(cfg)
 
     if seg["cv_aggregation"] not in CV_AGGREGATIONS:
         _fail("enums", f"cv_aggregation desconocido: {seg['cv_aggregation']}")
     if stab["stability_rule"] not in STABILITY_RULE_NAMES:
         _fail("enums", f"stability_rule desconocida: {stab['stability_rule']}")
-    cands = stab["segment_candidates"]
-    if not (isinstance(cands, list) and cands and set(cands) <= SEGMENT_KINDS):
-        _fail("enums", f"segment_candidates debe ser subconjunto de {sorted(SEGMENT_KINDS)}")
-    if stab["segment_criterion"] not in SEGMENT_CRITERIA:
-        _fail("enums", f"segment_criterion desconocido: {stab['segment_criterion']}")
     if stab["stability_rule_criterion"] not in RULE_CRITERIA:
         _fail("enums", f"stability_rule_criterion desconocido: {stab['stability_rule_criterion']}")
     if seg["usage_period"] not in USAGE_PERIODS:
@@ -216,6 +222,9 @@ def validate_config(cfg: dict) -> None:
     for key in ("backtest_folds", "snaive_m", "sarima_s"):
         if not (_is_int(fc[key]) and fc[key] >= 1):
             _fail("forecast", f"{key} debe ser entero ≥ 1")
+    last_year = list(train_years(cfg).values())[-1]
+    if fc["backtest_folds"] * cfg["split"]["horizon"] > last_year[1] - last_year[0] + 1:
+        _fail("forecast", "backtest_folds × horizon debe caber en el último año de train")
     if not (fc["subset_size"] == "all" or (_is_int(fc["subset_size"]) and fc["subset_size"] >= 1)):
         _fail("forecast", "subset_size debe ser 'all' o entero ≥ 1")
     if not (isinstance(fc["selection_level"], str) and fc["selection_level"].strip()):
