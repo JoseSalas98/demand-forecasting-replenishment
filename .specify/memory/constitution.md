@@ -1,5 +1,22 @@
 <!--
 Sync Impact Report
+- Version change: 2.0.0 → 2.1.0 (MINOR, 2026-11-01)
+- Motivo: guía ampliada. Durante la experimentación en train se definen tantos parámetros como
+  exija el método adecuado, aunque no estén previstos en esta constitución ni en la config.
+- Modified principles:
+  - III. Parámetros configurables: se admiten parámetros de método definidos durante la
+    experimentación, documentados donde se estiman (notebook canónico) con su motivo.
+  - VI. Método y congelamiento: el notebook 03 por etapas es la versión canónica de la
+    segmentación sobre train; lo que el flujo anterior exportaba o congelaba y el nb 03 no produce
+    deja de tomarse en cuenta. Se congelan los cortes y reglas que surgieron en el nb 03 y la lista
+    de artículos para modelado.
+- Removed sections: ninguna.
+- Impacto sobre artefactos congelados: `matrix_train`, `train_cuts` y `zero_thresholds` (v1, del
+  flujo `run_train_matrix`) quedan sin uso; no se borran. `targets` se congela desde el nb 03.
+- Artefactos por actualizar: tasks.md (estado de las etapas 3–5 y del modelado), código que lee
+  los artefactos sin uso (`src/forecasting.py`, `src/stability.py`).
+
+Historial 2.0.0
 - Version change: 1.2.0 → 2.0.0 (MAJOR, 2026-10-29)
 - Motivo del MAJOR: se redefinen reglas del Principio VI (NO NEGOCIABLE) de forma incompatible
   con la versión anterior: cambian las comparaciones de estabilidad y se elimina la elección del
@@ -137,6 +154,11 @@ enseñan al modelo una demanda nula que no se observó.
   (Principio VI).
 - Cada cambio de parámetro DEBE quedar registrado con fecha, valor anterior, valor nuevo y
   motivo.
+- **Parámetros de método definidos en la experimentación:** se definen tantos parámetros como sean
+  necesarios para llevar a cabo el método adecuado durante la experimentación en train, aunque no
+  estén previstos en esta constitución ni en la config (por ejemplo, el mínimo de días observados
+  por bloque o el mínimo de bloques válidos del CV). Cada uno se documenta, con su valor y su
+  motivo, en el notebook canónico donde se estima, y se congela con el resultado.
 - **Abstracciones:** una clase o función auxiliar se crea solo si cumple al menos una condición:
   (a) encapsula una regla de negocio que cambia de forma independiente, (b) se usa en al menos
   dos lugares del flujo, o (c) mantiene un estado que debe persistir entre llamadas. Si no, la
@@ -227,6 +249,9 @@ sin dejar rastro.
   con train, con su criterio declarado antes de ejecutarlo, y sus valores finales se congelan.
 - Los candidatos de búsqueda DEBEN declararse antes de ejecutar la experimentación. Sus valores
   concretos se definen en esa fase.
+- **Versión canónica de la segmentación:** `notebooks/03_abc_xyz_train.ipynb`, por etapas
+  auditables. Sus cortes, reglas y la lista de artículos para modelado son los que se congelan; lo
+  que el flujo anterior exportaba o congelaba y el nb 03 no produce deja de tomarse en cuenta.
 - Una vez seleccionados, todos los elementos quedan congelados. El test se evalúa una sola vez
   por modelo.
 - Ningún parámetro se cambia después de ver resultados de test. Un cambio posterior a la
@@ -284,4 +309,4 @@ MAPE no está definido o se distorsiona.
   la centralización de parámetros, el registro de rechazos, el aislamiento del test y la
   justificación escrita de cada abstracción.
 
-**Version**: 2.0.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-10-29
+**Version**: 2.1.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-11-01
