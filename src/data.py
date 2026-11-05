@@ -494,6 +494,57 @@ def profile_frame(df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def to_daily_frame(arr: np.ndarray, item_ids, start_d: int, end_d: int) -> pd.DataFrame:
+    """Recorta un arreglo artículo × día (columna j = día j + 1) a [start_d, end_d] como DataFrame.
+
+    Parámetros:
+        arr (np.ndarray): arreglo ancho desde d_1 (por ejemplo, `item_units` de `load_interim`).
+        item_ids (array-like): identificador de cada fila.
+        start_d (int): primer día (inclusivo).
+        end_d (int): último día (inclusivo).
+
+    Retorno:
+        pd.DataFrame: float64, índice `item_id` y columnas `d_<día>`.
+    """
+    return pd.DataFrame(
+        np.asarray(arr[:, start_d - 1 : end_d], dtype=float),
+        index=pd.Index(np.asarray(item_ids, dtype=object), name="item_id"),
+        columns=[f"d_{d}" for d in range(start_d, end_d + 1)],
+    )
+
+
+def sales_overview(units: np.ndarray, series_index: pd.DataFrame) -> pd.Series:
+    """Resumen del arreglo ancho de ventas crudas: tamaño, nulos y valores fuera de dominio.
+
+    Cuenta por separado los negativos y los no enteros porque la regla de dominio (Principio II)
+    rechaza ambos, y conviene saber si existen antes de cualquier tratamiento.
+
+    Parámetros:
+        units (np.ndarray): unidades crudas (series × día), como las devuelve `load_sales`.
+        series_index (pd.DataFrame): `store_id, item_id` de cada fila de `units`.
+
+    Retorno:
+        pd.Series: `series`, `stores`, `items`, `days`, `cells`, `nan_cells`, `negative_cells`,
+        `non_integer_cells`, `zero_cells`, `zero_pct` (0–100) y `total_units`.
+    """
+    finite = units[np.isfinite(units)]
+    return pd.Series(
+        {
+            "series": units.shape[0],
+            "stores": series_index["store_id"].nunique(),
+            "items": series_index["item_id"].nunique(),
+            "days": units.shape[1],
+            "cells": units.size,
+            "nan_cells": int(np.isnan(units).sum()),
+            "negative_cells": int((finite < 0).sum()),
+            "non_integer_cells": int((finite != np.round(finite)).sum()),
+            "zero_cells": int((finite == 0).sum()),
+            "zero_pct": round(float((finite == 0).mean() * 100), 2),
+            "total_units": float(finite.sum()),
+        }
+    )
+
+
 def mask_summary(
     mask_reason: np.ndarray, units_raw: np.ndarray, series_index: pd.DataFrame
 ) -> pd.DataFrame:

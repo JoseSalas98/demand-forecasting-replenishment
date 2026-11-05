@@ -203,3 +203,17 @@ def test_profile_frame_counts_nulls_and_unique():
     assert list(prof.columns) == ["dtype", "nulls", "null_pct", "unique"]
     assert prof.loc["a", "nulls"] == 1 and prof.loc["a", "null_pct"] == 25.0
     assert prof.loc["a", "unique"] == 2 and prof.loc["b", "unique"] == 4
+
+
+def test_sales_overview_counts_domain_violations():
+    from src.data import sales_overview
+
+    units = np.array([[0.0, 1.0, np.nan], [2.5, -1.0, 3.0]], dtype=np.float32)
+    index = pd.DataFrame({"store_id": ["S1", "S2"], "item_id": ["I1", "I1"]})
+    out = sales_overview(units, index)
+    assert out["series"] == 2 and out["stores"] == 2 and out["items"] == 1 and out["days"] == 3
+    assert out["nan_cells"] == 1
+    assert out["negative_cells"] == 1
+    assert out["non_integer_cells"] == 1
+    assert out["zero_cells"] == 1
+    assert out["total_units"] == 5.5
