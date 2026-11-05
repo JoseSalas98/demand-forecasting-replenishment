@@ -132,7 +132,7 @@ def test_backtest_logs_failures_and_continues(replicated, monkeypatch):
     scores, failures = run_backtest(shares, agg, targets, cfg)
     assert "fallo simulado" in " ".join(failures["message"])
     assert set(failures.columns) == {"item_id", "candidate_id", "stage", "message"}
-    assert {"snaive_7", "moving_average_7"} <= set(scores["candidate_id"])
+    assert {f"snaive_{cfg['forecast']['snaive_m']}", "moving_average_7"} <= set(scores["candidate_id"])
     assert set(scores["fold"]) == {1, 2}
 
 
