@@ -32,3 +32,15 @@ def test_wape_and_rmse():
     y_hat = np.array([1.0, 1.0, 4.0, 9.0])
     assert np.isclose(wape(y, y_hat), 2.0 / 6.0)
     assert np.isclose(rmse(y, y_hat), np.sqrt(2.0 / 3.0))
+
+
+def test_seasonal_naive_scale():
+    import math
+
+    import numpy as np
+
+    from src.metrics import seasonal_naive_scale
+
+    x = np.array([1.0, 2.0, 3.0, 5.0, 2.0, 6.0])     # diferencias con m = 3: 4, 0, 3
+    assert seasonal_naive_scale(x, 3) == (16 + 0 + 9) / 3
+    assert math.isnan(seasonal_naive_scale(x[:3], 3))
