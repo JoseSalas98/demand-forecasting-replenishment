@@ -1200,3 +1200,109 @@ def friedman_seasonality(ratios: pd.DataFrame, n_perm: int = 10_000, seed: int =
             "kendall_w": stat / (b * (k - 1)),
         }
     return pd.DataFrame.from_dict(rows, orient="index").rename_axis("class")
+
+
+# --- Ciclo de vida y enmascarado de quiebres (llevados del nb 03, Etapa 1) -----------------------
+# Justificación (Principio III, b): los usan el nb 03 (segmentación) y el nb 04 (pronóstico).
+# Trabajan sobre DataFrames artículo × día con columnas `d_<día>`.
+
+
+def _day_numbers(frame: pd.DataFrame) -> np.ndarray:
+    """Número de día de cada columna `d_<día>`."""
+    return np.array([int(c[2:]) for c in frame.columns])
+
+
+def lifecycle_bounds(units: pd.DataFrame) -> pd.DataFrame:
+    """Primer y último día con venta > 0 de cada artículo dentro de las columnas de `units`.
+
+    Parámetros:
+        units (pd.DataFrame): unidades artículo × día (`d_<día>`); NaN = sin dato.
+
+    Retorno:
+        pd.DataFrame: `first_sale_d`, `last_sale_d` y `lifecycle_days` por artículo (NaN si el
+        artículo no vende en el rango).
+    """
+    days = _day_numbers(units)
+    sold = units.to_numpy() > 0
+    has_sale = sold.any(axis=1)
+    first = np.where(has_sale, days[sold.argmax(axis=1)], np.nan)
+    last = np.where(has_sale, days[len(days) - 1 - sold[:, ::-1].argmax(axis=1)], np.nan)
+    out = pd.DataFrame({"first_sale_d": first, "last_sale_d": last}, index=units.index)
+    out["lifecycle_days"] = out["last_sale_d"] - out["first_sale_d"] + 1
+    return out
+
+
+def trim_lifecycle(units: pd.DataFrame, bounds: pd.DataFrame) -> pd.DataFrame:
+    """Copia de `units` con NaN antes de `first_sale_d` y después de `last_sale_d`.
+
+    Parámetros:
+        units (pd.DataFrame): unidades artículo × día.
+        bounds (pd.DataFrame): salida de `lifecycle_bounds` para los mismos artículos.
+
+    Retorno:
+        pd.DataFrame: unidades recortadas, mismo índice y columnas que `units`.
+    """
+    days = _day_numbers(units)
+    inside = (days >= bounds["first_sale_d"].to_numpy()[:, None]) & (
+        days <= bounds["last_sale_d"].to_numpy()[:, None]
+    )
+    return units.where(inside)
+
+
+def find_zero_runs(units_lc: pd.DataFrame) -> pd.DataFrame:
+    """Rachas de ceros de cada artículo con `zero_runs`, a partir de un DataFrame artículo × día.
+
+    Parámetros:
+        units_lc (pd.DataFrame): unidades artículo × día con columnas contiguas `d_<día>`.
+
+    Retorno:
+        pd.DataFrame: `item_id, position, start_d, end_d, length` (días en base 1).
+    """
+    days = _day_numbers(units_lc)
+    start_d, end_d = int(days[0]), int(days[-1])
+    full = np.full((len(units_lc), end_d), np.nan)
+    full[:, start_d - 1 :] = units_lc.to_numpy()
+    agg = {"item_ids": units_lc.index.to_numpy(dtype=object), "item_units": full}
+    return zero_runs(agg, start_d, end_d)
+
+
+def classify_runs(runs: pd.DataFrame, long_run: pd.Series) -> pd.DataFrame:
+    """Etiqueta cada racha interna: `break` si su largo ≥ LONG_RUN del artículo, `demand` si no.
+
+    Las rachas no internas (`leading`, `trailing`) conservan su posición como tipo y nunca se
+    enmascaran. Lanza ValueError si un artículo con rachas no tiene LONG_RUN.
+
+    Parámetros:
+        runs (pd.DataFrame): salida de `find_zero_runs`.
+        long_run (pd.Series): `item_id` → LONG_RUN congelado.
+
+    Retorno:
+        pd.DataFrame: `runs` con las columnas `long_run` y `kind`.
+    """
+    out = runs.assign(long_run=runs["item_id"].map(long_run))
+    if out["long_run"].isna().any():
+        raise ValueError("hay artículos con rachas y sin LONG_RUN.")
+    internal = (out["position"] == "internal").to_numpy()
+    long = (out["length"] >= out["long_run"]).to_numpy()
+    out["kind"] = np.where(internal, np.where(long, "break", "demand"), out["position"])
+    return out
+
+
+def mask_breaks(units_lc: pd.DataFrame, runs_kind: pd.DataFrame) -> pd.DataFrame:
+    """Copia de `units_lc` con los ceros de las rachas `break` en NaN (los NaN previos se quedan).
+
+    Parámetros:
+        units_lc (pd.DataFrame): unidades artículo × día.
+        runs_kind (pd.DataFrame): salida de `classify_runs` sobre los mismos artículos.
+
+    Retorno:
+        pd.DataFrame: unidades con los quiebres enmascarados.
+    """
+    out = units_lc.to_numpy(copy=True)
+    start_d = int(_day_numbers(units_lc)[0])
+    breaks = runs_kind[runs_kind["kind"] == "break"]
+    rows = units_lc.index.get_indexer(breaks["item_id"])
+    for r, a, b in zip(rows, breaks["start_d"].to_numpy(), breaks["end_d"].to_numpy()):
+        block = out[r, a - start_d : b - start_d + 1]
+        block[block == 0] = np.nan
+    return pd.DataFrame(out, index=units_lc.index, columns=units_lc.columns)
