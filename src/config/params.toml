@@ -40,7 +40,7 @@ AZ = "promotion_priority"
 selection_level = "item"             # etiquetas definidas por el analista durante la experimentación
 subset_size = "all"                  # "all" o entero N (los N primeros por gasto en train)
 backtest_folds = 13                  # 13 × 28 días = Y4 completo (R16)
-snaive_m = 7
+snaive_m = 13                        # seasonal naive en bloques de 28 días: mismo periodo del año anterior
 ma_windows = [7, 14, 28, 56]
 arima_p = [0, 1, 2]
 arima_d = [0, 1]
@@ -50,3 +50,24 @@ sarima_s = 7
 
 [metrics]
 weight_window = [1550, 1577]
+
+[features]                           # nb 04, Etapa 6 (bloques de 28 días; h = 1, así que todo rezago ≥ 1 es válido)
+target_lags = [1, 2, 3, 13]          # 1–3: dinámica reciente; 13: mismo periodo del año anterior
+rolling_windows = [3, 6, 13]         # bloques anteriores: ~trimestre, ~semestre, año
+rolling_stats = ["mean", "std", "median", "range"]   # range = máximo − mínimo
+event_lags = [1, 2]                  # rezagos de los conteos de eventos (efecto posterior)
+low_block_share = 0.1                # bloque válido con unidades < 10 % de su referencia = quiebre escondido (nb 04, 4.2)
+low_block_window = 6                 # referencia: mediana de los últimos 6 bloques válidos (un semestre); al inicio, la de los primeros 6
+atypical_level = 0.5                 # nb 04, 4.2: bloque válido con < 50 % de su mediana reciente = deprimido; atípico si el mismo periodo no lo estuvo en años anteriores
+atypical_min_ref = 3                 # mínimo de bloques válidos para la mediana de referencia (con 1–2 la mediana es un solo bloque)
+atypical_years = 3                   # años anteriores que se miran para decidir si la caída es un patrón del artículo (todo el train)
+atypical_level_masked = 0.8          # nb 04, 4.4 (E1, causal en ventana y test): con días enmascarados, deprimido = < 80 % (un quiebre parcial deja el bloque entre 50 y 80 %)
+atypical_pattern_years = 2           # nb 04, 4.4 (E7): la caída es patrón solo si se repite en 2 de los años anteriores (con 1 bastaba una coincidencia)
+atypical_refill_level = 0.8          # nb 04, 4.4 (E8): el no válido que sigue a un bloque < 80 % de su nivel toma la mediana reciente en vez de copiarlo
+case_low_level = 0.8                 # nb 04, 4.4: clasificación de ratios extremos; t−1 bajo si < 80 % de su nivel previo
+case_high_level = 1.25               # nb 04, 4.4: t alto si > 125 % (simétrico de 0,8 en escala log: 1 / 0,8)
+case_masked_days = 14                # nb 04, 4.4: quiebre prolongado si hay ≥ 14 días enmascarados (medio bloque) en t−6..t−1
+case_start_blocks = 7                # nb 04, 4.4: arranque = posiciones ≤ 7 (la referencia de 6 bloques antes de t−1 está completa desde la posición 8)
+min_ratio_start = 0.5                # nb 04, 6a (E11): en el arranque también queda vacío el ratio < 0,5 (simétrico de max_ratio = 2)
+max_ratio = 2.0                      # nb 04, 6a: ratio > 2 (la demanda se duplica) queda vacío ANTES de rezagos y ventanas; la fila se pronostica y se mide igual
+seed = 42                            # semilla única de todo lo aleatorio del nb 04 (muestras, modelos); su valor no importa, solo que sea fija (R6)

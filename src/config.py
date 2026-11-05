@@ -47,7 +47,28 @@ REQUIRED_KEYS = [
     "forecast.sarima_PDQ",
     "forecast.sarima_s",
     "metrics.weight_window",
+    "features.target_lags",
+    "features.rolling_windows",
+    "features.rolling_stats",
+    "features.event_lags",
+    "features.seed",
+    "features.low_block_share",
+    "features.low_block_window",
+    "features.max_ratio",
+    "features.atypical_level",
+    "features.atypical_min_ref",
+    "features.atypical_years",
+    "features.atypical_level_masked",
+    "features.atypical_pattern_years",
+    "features.atypical_refill_level",
+    "features.case_low_level",
+    "features.case_high_level",
+    "features.case_masked_days",
+    "features.case_start_blocks",
+    "features.min_ratio_start",
 ]
+
+ROLLING_STATS = {"mean", "std", "median", "range"}
 
 CV_AGGREGATIONS = {"block28", "daily", "weekly"}
 STABILITY_RULE_NAMES = {"abc_all", "abc_xyz_all", "cell_majority", "a_every_year"}
@@ -229,6 +250,44 @@ def validate_config(cfg: dict) -> None:
         _fail("forecast", "subset_size debe ser 'all' o entero ≥ 1")
     if not (isinstance(fc["selection_level"], str) and fc["selection_level"].strip()):
         _fail("forecast", "selection_level debe ser una cadena no vacía")
+
+    feat = cfg["features"]
+    for key in ("target_lags", "rolling_windows", "event_lags"):
+        if not _int_list(feat[key], min_value=1):
+            _fail("features", f"{key} debe ser una lista de enteros ≥ 1 (h = 1)")
+    if not (feat["rolling_stats"] and set(feat["rolling_stats"]) <= ROLLING_STATS):
+        _fail("features", f"rolling_stats debe ser un subconjunto no vacío de {sorted(ROLLING_STATS)}")
+    if not (isinstance(feat["low_block_share"], (int, float)) and 0 < feat["low_block_share"] < 1):
+        _fail("features", "low_block_share debe estar entre 0 y 1")
+    if not (_is_int(feat["low_block_window"]) and feat["low_block_window"] >= 2):
+        _fail("features", "low_block_window debe ser un entero ≥ 2")
+    if not (isinstance(feat["max_ratio"], (int, float)) and feat["max_ratio"] > 1):
+        _fail("features", "max_ratio debe ser un número > 1 (un ratio ≤ 1 no es una subida)")
+    if not (isinstance(feat["atypical_level"], (int, float)) and 0 < feat["atypical_level"] < 1):
+        _fail("features", "atypical_level debe estar entre 0 y 1")
+    if not (_is_int(feat["atypical_min_ref"]) and 1 <= feat["atypical_min_ref"] <= feat["low_block_window"]):
+        _fail("features", "atypical_min_ref debe ser un entero entre 1 y low_block_window")
+    if not (_is_int(feat["atypical_years"]) and feat["atypical_years"] >= 1):
+        _fail("features", "atypical_years debe ser un entero ≥ 1")
+    num = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
+    if not (num(feat["atypical_level_masked"]) and feat["atypical_level"] <= feat["atypical_level_masked"] < 1):
+        _fail("features", "atypical_level_masked debe estar entre atypical_level y 1")
+    if not (_is_int(feat["atypical_pattern_years"]) and 1 <= feat["atypical_pattern_years"] <= feat["atypical_years"]):
+        _fail("features", "atypical_pattern_years debe ser un entero entre 1 y atypical_years")
+    if not (num(feat["atypical_refill_level"]) and 0 < feat["atypical_refill_level"] <= 1):
+        _fail("features", "atypical_refill_level debe estar entre 0 y 1")
+    if not (num(feat["case_low_level"]) and 0 < feat["case_low_level"] < 1):
+        _fail("features", "case_low_level debe estar entre 0 y 1")
+    if not (num(feat["case_high_level"]) and feat["case_high_level"] > 1):
+        _fail("features", "case_high_level debe ser > 1")
+    if not (_is_int(feat["case_masked_days"]) and 1 <= feat["case_masked_days"] <= 6 * 28):
+        _fail("features", "case_masked_days debe ser un entero entre 1 y 168 (6 bloques)")
+    if not (_is_int(feat["case_start_blocks"]) and feat["case_start_blocks"] >= 2):
+        _fail("features", "case_start_blocks debe ser un entero ≥ 2")
+    if not (num(feat["min_ratio_start"]) and 0 < feat["min_ratio_start"] < 1):
+        _fail("features", "min_ratio_start debe estar entre 0 y 1")
+    if not (_is_int(feat["seed"]) and feat["seed"] >= 0):
+        _fail("features", "seed debe ser un entero ≥ 0")
 
 
 def _same_value(logged: str, value: Any) -> bool:
