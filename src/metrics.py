@@ -29,6 +29,29 @@ def naive_scale(train_units: np.ndarray) -> float:
     return float(np.mean(diffs**2))
 
 
+def seasonal_naive_scale(train_units: np.ndarray, m: int) -> float:
+    """Escala del RMSSE con el seasonal naive: media de (y_t − y_{t−m})² en la muestra.
+
+    Constitución (Principio VII) y FR-027: escala = error del seasonal naive en la muestra, con
+    m = 13 bloques de 28 días (un año). Se calcula con todo el train del artículo (decisión del
+    usuario, como en M5): dentro de un artículo todos los candidatos se dividen por la misma
+    escala, así que no cambia cuál gana.
+
+    Parámetros:
+        train_units (np.ndarray): unidades de train del artículo, en orden de bloque.
+        m (int): periodo estacional en bloques.
+
+    Retorno:
+        float: escala; NaN si hay menos de m + 1 bloques.
+    """
+    x = np.asarray(train_units, dtype=float)
+    if len(x) <= m:
+        return float("nan")
+    diffs = x[m:] - x[:-m]
+    diffs = diffs[~np.isnan(diffs)]
+    return float(np.mean(diffs**2)) if len(diffs) else float("nan")
+
+
 def _valid(y: np.ndarray, y_hat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Filtra los pares donde el real o el pronóstico son NaN."""
     y = np.asarray(y, dtype=float)
