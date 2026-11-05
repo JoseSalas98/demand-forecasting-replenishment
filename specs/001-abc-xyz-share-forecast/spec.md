@@ -1,4 +1,4 @@
-# Feature Specification: Segmentación ABC × XYZ y pronóstico de participación (M5)
+# Feature Specification: Segmentación ABC × XYZ y pronóstico de unidades por ratio entre bloques (M5)
 
 **Feature Branch**: `main` (no se creó rama; no hay hook `before_specify` registrado)
 
@@ -44,9 +44,25 @@ Alineación con la constitución 2.0.0, a partir de lo aprendido en la exploraci
 - Q: ¿Contra qué se compara cada año en la estabilidad de train? → A: Con dos bases y los mismos artículos: el año anterior (Yt−1 → Yt) y el año 1 fijo (Y1 → Yt), sin promediar años. Los cortes se eligen en la base y se aplican al objetivo por participación en el gasto. Motivo: el promedio de años previos mueve los cortes y el crecimiento del catálogo encoge la clase A sin que los artículos cambien.
 - Q: ¿Con qué se mide la estabilidad? → A: Con medidas pareadas, porque base y objetivo son los mismos artículos: kappa de Cohen plano, Stuart–Maxwell y mayor cambio en puntos porcentuales, más mantiene / mejora / empeora (y mixto en ABC × XYZ). El PSI se deja de usar.
 - Q: ¿Se elige un periodo de segmentación (trimestre o cuatrimestre)? → A: No. La exploración intraanual no mostró que la clase dependa de la época del año; la clase se define por año.
-- Q: ¿Cómo se tratan los ceros internos? → A: Las rachas de ceros iguales o más largas que el umbral del artículo se tratan como no observadas (NaN) en el CV de XYZ y en la serie de participación. El umbral es el menor k tal que la probabilidad de que la racha más larga sea ≥ k, con días independientes y la tasa de ceros observada del artículo en train, es ≤ α (por defecto 0,01). Wald–Wolfowitz por artículo como diagnóstico; si no se puede estimar, `LONG_RUN` = 7.
-- Q: ¿Dónde caen los folds del backtesting? → A: 13 orígenes cada 28 días repartidos en el año 4, igual que el test, para que la selección vea todo el ciclo anual.
+- Q: ¿Cómo se tratan los ceros internos? → A: Las rachas de ceros iguales o más largas que el umbral del artículo se tratan como no observadas (NaN) en el CV de XYZ y en la serie de pronóstico. El umbral es el menor k tal que la probabilidad de que la racha más larga sea ≥ k, con días independientes y la tasa de ceros observada del artículo en train, es ≤ α (por defecto 0,01). Wald–Wolfowitz por artículo como diagnóstico; si no se puede estimar, `LONG_RUN` = 7.
+- Q: ¿Dónde caen los folds del backtesting? → A: 13 orígenes cada 28 días repartidos en el año 4, igual que el test, para que la selección vea todo el ciclo anual. **Actualizada el 2026-11-02:** con reentrenamiento en cada fold (ver Session 2026-11-02).
 - Q: ¿Cómo se eligen los cortes de train? → A: ABC con la regla de % de artículos y % de gasto, y XYZ con la búsqueda de cortes sobre la distribución del CV; se ejecutan sobre train y se congelan.
+
+### Session 2026-11-02
+
+Decisiones de la Etapa 0 del nb 04 (constitución 3.0.0).
+
+- Q: ¿Qué es el artículo y qué se pronostica? → A: `item_id` sumado sobre las 10 tiendas. Se pronostican sus unidades por bloque mediante el ratio r_t = unidades_t ÷ unidades_{t−1} (corregido, constituciones 5.0.0 y 6.0.0: antes, participación en la cadena).
+- Q: ¿Con qué periodo y horizonte? → A: Bloques de 28 días (52 en train, 13 en test), un bloque adelante (h = 1), con pronóstico en cada bloque. Los meses calendario no encajan con el split (mayo 2015 queda partido).
+- Q: ¿Cómo se pasa de diario a bloque? → A: El valor del bloque es la suma de sus unidades. `min_days` no se aplica en el modelado (solo sirvió para el CV) y ningún bloque se descarta. La serie va del bloque de la primera venta (aunque sea un solo día) al de la última venta; se recortan los ceros iniciales y finales (corregido, constitución 4.0.0).
+- Q: ¿Qué candidatos se comparan? → A: Seasonal naive (ŷ_t = y_{t−13}, única línea base), SARIMAX con covariables de calendario y eventos del bloque, y boosting global (XGBoost, LightGBM, CatBoost) con `item_id` y `cell`. En el piloto se compara el boosting global con una variante por artículo en 20–30 artículos antes de decidir.
+- Q: ¿Cómo se codifica el calendario? → A: Año como entero; periodo del año 1–13 como categórica ordinal. Eventos por bloque: cantidad de eventos de cada tipo (`n_religious`, `n_national`, `n_cultural`, `n_sporting`; corregido en la Etapa 5 del nb 04, decisión del usuario), con rezagos t−1 y t−2 tomados del calendario. Sin adelanto t+1 (descartado por el usuario, Etapa 6b).
+- Q: ¿Cómo se valida? → A: Partición por artículo: test = últimos 13 bloques de su ciclo de vida, validación = los 13 anteriores, train = el resto; mínimo 39 bloques (3 años). 13 folds de origen móvil con ventana expansiva sobre la validación y reentrenamiento en cada bloque (FR-024). El test (nb 05) usa el mismo régimen (corregido, constitución 4.0.0).
+- Q: ¿Cómo se elige el modelo de cada artículo? → A: RMSSE por artículo (escala = error del seasonal naive en la muestra, m = 13). Un candidato compite solo si su error en las ventanas de validación es menor que el del seasonal naive en esas ventanas; gana el de menor error y, si ninguno pasa, el seasonal naive. WRMSSE agregado; WAPE, MAE y RMSE como diagnóstico.
+- Q: ¿Qué transformación del objetivo se usa? → A: Ninguna: el objetivo es el ratio sin transformar; rezagos y ventanas se calculan sobre él. El pronóstico es unidades_{t−1} × r̂_t y el error se mide en unidades (constitución 5.0.0; la Etapa 6d queda sin efecto).
+- Q: ¿Qué pasa con un bloque que pasó `min_days` pero casi no vendió? → A: Si vende menos del 10 % de la mediana de sus últimos 6 bloques válidos (en sus primeros 6 bloques, de la mediana de los válidos de esos 6; el bloque 1 no se evalúa), es un quiebre escondido por ventas sueltas y se trata como no válido (constitución 6.2.0; parámetros `low_block_share` y `low_block_window`).
+- Q: ¿Qué pasa con un bloque no válido (menos días observados que `min_days`, incluido el de 0 días)? → A: Toma el valor del bloque anterior del mismo artículo (ratio = 1, "no cambió") y el bloque siguiente se compara contra el último bloque válido. Los bloques no válidos al inicio del ciclo de vida, sin bloque anterior, se eliminan y la serie empieza en el primer bloque válido (antes de la partición y del mínimo de 39 bloques). Se miden todos los bloques (constitución 6.0.0; reemplaza la interpolación lineal de la 5.0.0).
+- Q: ¿Y la réplica en el año 5, hecha antes de declarar los candidatos? → A: Se declaran ahora, antes de cualquier backtesting; la réplica no alimentó ninguna selección.
 
 ## Orden de ejecución
 
@@ -56,7 +72,9 @@ Las historias están numeradas en el orden en que se ejecutan:
 2. Matriz ABC × XYZ sobre train, congelada (US2).
 3. Estabilidad, lista objetivo y tratamiento, congelados (US3).
 4. Declaración de los candidatos de pronóstico y de `selection_level`, y réplica en el año 5 (US4).
-5. Backtesting en train y evaluación única en test (US5).
+5. Backtesting y selección por artículo en train, y reentrenamiento de los ganadores con los años
+   1–4 (US5, nb 04).
+6. Evaluación única en test, 13 orígenes del año 5 (US5, nb 05).
 
 ## User Scenarios & Testing *(mandatory)*
 
@@ -179,35 +197,35 @@ ninguna etapa de selección de modelos lea el resultado.
 
 ---
 
-### User Story 5 - Pronóstico de participación a 28 días evaluado en test (Priority: P5)
+### User Story 5 - Pronóstico de unidades por bloque de 28 días evaluado en test (Priority: P5)
 
-El analista obtiene para cada producto objetivo de clase A el pronóstico de su participación en
-unidades a 28 días con el mejor modelo entre las líneas base (seasonal naive y medias móviles),
-ARIMA y SARIMA. El modelo se elige solo con backtesting en train y se evalúa una única vez en el
-test (año 5, 13 orígenes cada 28 días, sin solapamiento).
+El analista obtiene para cada producto objetivo de clase A el pronóstico de sus unidades del
+bloque de 28 días siguiente, vía el ratio entre bloques, con el mejor modelo del artículo entre seasonal naive,
+SARIMAX, XGBoost, LightGBM y CatBoost. El modelo se elige solo con backtesting en train y se
+evalúa una única vez en el test (año 5, 13 orígenes cada 28 días, sin solapamiento).
 
 **Why this priority**: es la última etapa y cierra el RMV. Depende de la lista congelada (US3) y
 de la réplica en el año 5 (US4).
 
 **Independent Test**: con la lista congelada, se ejecuta la selección en train y la evaluación en
-test. Se verifica que el WRMSSE del modelo elegido sea menor que el del seasonal naive en el
+test. Se verifica que el WRMSSE del conjunto elegido sea menor que el del seasonal naive en el
 mismo conjunto y los mismos 13 orígenes.
 
 **Acceptance Scenarios**:
 
 1. **Given** los candidatos de búsqueda declarados antes de la réplica en el año 5, **When** se
-   ejecuta el backtesting en train, **Then** se elige un modelo al nivel indicado en
-   `selection_level` usando solo train, y el modelo y sus parámetros quedan congelados.
+   ejecuta el backtesting en train, **Then** se elige un modelo por artículo usando solo train, y
+   el modelo y sus hiperparámetros u órdenes quedan congelados.
 2. **Given** un candidato de búsqueda cambiado después de la réplica en el año 5, **When** se pide
    el backtesting, **Then** el proceso se detiene y exige una nueva versión.
 3. **Given** el modelo congelado, **When** se evalúa en test, **Then** se producen pronósticos en
-   13 orígenes consecutivos cada 28 días, sin reentrenar. Solo se actualizan los datos observados
-   y los parámetros se mantienen fijos.
-4. **Given** los pronósticos de participación, **When** se convierten a unidades, **Then** se usa
-   el total real de unidades de la cadena del periodo; el total de la cadena no se pronostica.
-5. **Given** los resultados de test, **When** se compara con la línea base, **Then** el modelo
-   solo se acepta si su WRMSSE es menor que el del seasonal naive. WAPE y RMSE se reportan como
-   diagnóstico sin umbral, y MAPE no se usa.
+   13 orígenes consecutivos cada 28 días (h = 1 bloque). En cada origen el modelo se reentrena con
+   todo lo observado hasta ese origen, con hiperparámetros y órdenes congelados.
+4. **Given** el ratio pronosticado r̂_t, **When** se convierte a unidades, **Then** se usa
+   unidades_{t−1} × r̂_t con las unidades observadas del bloque anterior.
+5. **Given** los resultados de test, **When** se compara con la línea base, **Then** el conjunto
+   elegido solo se acepta si su WRMSSE es menor que el del seasonal naive. RMSSE por artículo,
+   WAPE, MAE y RMSE se reportan como diagnóstico sin umbral, y MAPE no se usa.
 6. **Given** un ajuste de modelo que falla, **When** ocurre el fallo, **Then** se registra con el
    artículo y el candidato, y el proceso continúa con los demás candidatos.
 
@@ -232,11 +250,19 @@ mismo conjunto y los mismos 13 orígenes.
   identificador de artículo para que el resultado sea reproducible.
 - **Día con total de unidades de la cadena igual a cero:** la participación está indefinida; el día
   se registra y no entra en el cálculo de participación.
+- **Bloque con menos días observados que `min_days` (incluido el de 0 días), o que vende menos del
+  10 % de la mediana de sus últimos 6 bloques válidos:** toma el valor del bloque anterior; al
+  inicio del ciclo de vida se elimina. Se mide como cualquier otro bloque.
 - **Lista objetivo vacía:** el proceso se detiene y lo reporta. No se relajan criterios después de
   ver el año 5.
 - **Producto objetivo que cambia de clase en el año 5:** se reporta en la réplica; la lista y el
   tratamiento no cambian.
-- **Ningún modelo supera al seasonal naive:** el RMV no se cierra; se reporta el resultado.
+- **Artículo con menos de 39 bloques de ciclo de vida:** se excluye del modelado con su motivo
+  (FR-035).
+- **Ningún candidato le gana al seasonal naive en un artículo (validación):** el artículo usa el
+  seasonal naive.
+- **El conjunto elegido no supera al seasonal naive en WRMSSE:** el RMV no se cierra; se reporta
+  el resultado.
 - **Parámetro fuera de rango** (cortes ABC no crecientes, umbrales XYZ negativos o no crecientes,
   α fuera de (0, 1) o `LONG_RUN` < 1): el proceso se detiene antes de calcular.
 - **Cambio de parámetro después de la réplica en el año 5 o de ver el test:** exige una nueva
@@ -261,7 +287,10 @@ mismo conjunto y los mismos 13 orígenes.
   artículo agregado es el más temprano entre sus tiendas. Las filas de prelanzamiento sin precio
   no se cuentan como rechazos por precio ausente.
 - **FR-005**: El sistema DEBE partir los datos en un único train (años 1 a 4) y un único test
-  (año 5, 13 bloques de 28 días sin solapamiento), con fechas exactas fijadas en la configuración.
+  (año 5, 13 bloques de 28 días sin solapamiento), con fechas exactas fijadas en la configuración,
+  para la segmentación. En el pronóstico la partición es por artículo: test = últimos 13 bloques
+  de su ciclo de vida (el año 5 si vende hasta d_1941), validación = los 13 anteriores y train =
+  el resto.
 
 **Configuración**
 
@@ -300,8 +329,11 @@ mismo conjunto y los mismos 13 orígenes.
   el menor k tal que la probabilidad de que la racha de ceros más larga sea ≥ k, en sus n días
   activos y con días independientes con su tasa de ceros observada p₀, sea ≤ α (por defecto
   0,01, en la configuración). Las rachas internas de ceros de largo ≥ k se tratan como no
-  observadas (NaN) en el CV de XYZ y en la serie de participación; los ceros de arranque y finales
-  se tratan igual que en la exploración. La prueba de rachas de Wald–Wolfowitz por artículo se
+  observadas (NaN) en el CV de XYZ y en la serie de pronóstico; en la segmentación, los ceros
+  de arranque y finales se tratan igual que en la exploración. En la serie de pronóstico (nb 04 y
+  nb 05) el ciclo de vida va de la primera a la última venta, igual que en la segmentación. La
+  prueba de rachas de
+  Wald–Wolfowitz por artículo se
   reporta como diagnóstico. Si el umbral no se puede estimar, se usa `LONG_RUN` (por defecto 7) y
   se registra el motivo. Los umbrales se congelan (FR-020).
 - **FR-014**: El sistema DEBE entregar el ranking con gasto, porcentaje acumulado, CV, clase ABC,
@@ -349,24 +381,41 @@ mismo conjunto y los mismos 13 orígenes.
 
 **Pronóstico y evaluación**
 
-- **FR-022**: El sistema DEBE pronosticar la participación en unidades a 28 días de cada producto
-  objetivo de clase A: unidades del artículo agregado / unidades totales reales de la cadena.
-- **FR-023**: El sistema DEBE comparar como candidatos las líneas base (seasonal naive y medias
-  móviles), ARIMA y SARIMA, con candidatos de búsqueda declarados antes de la réplica en el año 5
-  (FR-030). Un candidato cambiado después de la réplica DEBE detener el backtesting.
-- **FR-024**: La selección de modelos y órdenes DEBE hacerse solo con backtesting dentro de train.
-  El nivel al que se elige el modelo (por producto, global o por grupo) se lee del parámetro
-  `selection_level`, cuyas etiquetas define el analista en la experimentación. El valor DEBE
-  declararse antes de la réplica en el año 5 y queda congelado con el modelo. El backtesting usa
-  13 orígenes cada 28 días repartidos en el año 4, sin solapamiento, igual que el test, para que
-  la selección cubra todo el ciclo anual.
-- **FR-025**: El sistema DEBE evaluar en test cada modelo una única vez, en 13 orígenes cada 28 días,
-  sin reentrenar y con parámetros fijos, actualizando solo los datos observados.
-- **FR-026**: El sistema DEBE convertir la participación a unidades usando el total real de la
-  cadena; no DEBE pronosticar el total de la cadena.
-- **FR-027**: El sistema DEBE calcular WRMSSE como criterio principal, y WAPE y RMSE como
-  diagnóstico. Un modelo DEBE rechazarse si su WRMSSE no es menor que el del seasonal naive.
+- **FR-022**: El sistema DEBE pronosticar, para cada producto objetivo de clase A, el ratio del
+  bloque de 28 días siguiente (h = 1): r_t = unidades del artículo agregado en el bloque t /
+  unidades en el bloque t − 1, sin transformar. El pronóstico en unidades es unidades_{t−1} × r̂_t.
+- **FR-023**: El sistema DEBE comparar como candidatos el seasonal naive (ŷ_t = y_{t−13}, única
+  línea base), SARIMAX con covariables exógenas del bloque, y boosting global (XGBoost, LightGBM y
+  CatBoost, con `item_id` y `cell` como variables). Los candidatos y sus espacios de búsqueda se
+  declaran antes del backtesting; un candidato cambiado después DEBE detener el backtesting.
+- **FR-024**: La selección de modelos, órdenes e hiperparámetros DEBE hacerse solo con backtesting
+  dentro de train, con 13 folds de origen móvil y ventana expansiva sobre los 13 bloques de
+  validación de cada artículo (FR-005): el fold k entrena con todo lo anterior a la validación más
+  los bloques 1 a k − 1 de la validación y predice el bloque k, con reentrenamiento en cada fold. Una configuración de boosting se elige por su error promedio en
+  los 13 folds; sin early stopping: `n_estimators` es un hiperparámetro más de la
+  búsqueda (decisión del usuario, constitución 6.1.0). Los órdenes SARIMAX se eligen una vez por AIC con los bloques anteriores
+  a la validación y sus coeficientes se reestiman en cada fold. El modelo se elige por artículo
+  (`selection_level` = item) y los ganadores se reentrenan con todo lo anterior al test.
+- **FR-025**: El sistema DEBE evaluar en test cada modelo una única vez, en 13 orígenes cada 28
+  días, con el régimen del backtesting: en cada origen se reentrena con todo lo observado hasta
+  ese origen, con hiperparámetros y órdenes congelados. Ninguna selección se repite con test.
+- **FR-027**: El sistema DEBE calcular RMSSE por artículo (escala = error del seasonal naive en la
+  muestra, m = 13). Un candidato compite en un artículo solo si su error en las ventanas de
+  validación es menor que el del seasonal naive en esas mismas ventanas; entre los que pasan gana
+  el de menor error y, si ninguno pasa, el artículo usa el seasonal naive. WRMSSE agregado es el
+  criterio principal; WAPE, MAE y RMSE son diagnóstico. El conjunto elegido DEBE rechazarse si su
+  WRMSSE no es menor que el del seasonal naive. Todo error se calcula en unidades.
 - **FR-028**: El sistema DEBE registrar cada fallo de ajuste con el artículo y el candidato.
+- **FR-033**: Las covariables DEBEN conocerse de antemano para el bloque pronosticado (año entero,
+  periodo del año 1–13 como categórica ordinal, banderas de evento del bloque) o estar rezagadas.
+  Las ventanas móviles usan solo bloques anteriores al registro (shift(1) antes de rolling).
+  Rezagos y ventanas se calculan por artículo sobre la serie completa antes del split, de modo que
+  los primeros bloques de test toman su memoria del final de train.
+- **FR-034**: El objetivo es el ratio sin transformar; rezagos y ventanas se calculan sobre
+  él, y cada pronóstico se reconstruye a unidades antes de medir el error.
+- **FR-035**: Solo se modelan los artículos con al menos 39 bloques de ciclo de vida (3 años: train
+  ≥ 13, validación 13 y test 13). Los demás se excluyen y se registran con su motivo. Si el test de
+  un artículo cae en fechas que para otros son train o validación, se documenta.
 
 **Exploración, réplica en el año 5 e informe**
 
@@ -405,8 +454,10 @@ mismo conjunto y los mismos 13 orígenes.
   y permanencia de clase y celda de cada producto objetivo. Solo diagnóstico.
 - **Configuración**: parámetros con valor por defecto e historial de cambios.
 - **Registro de rechazos y fallos**: motivo, fila, fuente, o artículo y candidato del modelo.
-- **Pronóstico**: participación y unidades por producto objetivo, origen y día del horizonte.
-- **Resultado de evaluación**: WRMSSE, WAPE y RMSE por modelo, frente al seasonal naive.
+- **Pronóstico**: ratio y unidades por producto objetivo, origen y bloque pronosticado.
+- **Selección por artículo**: candidato ganador, su error de validación y el del seasonal naive.
+- **Resultado de evaluación**: RMSSE por artículo, WRMSSE, WAPE, MAE y RMSE, frente al seasonal
+  naive.
 
 ## Success Criteria *(mandatory)*
 
@@ -422,8 +473,10 @@ mismo conjunto y los mismos 13 orígenes.
 - **SC-005**: La lista objetivo, su tratamiento y la declaración de los candidatos de pronóstico
   tienen fecha anterior a la réplica en el año 5, y la réplica tiene fecha anterior al
   backtesting y a la primera evaluación en test. Ninguna decisión usa datos del año 5.
-- **SC-006**: El modelo elegido tiene un WRMSSE menor que el del seasonal naive sobre los mismos
-  productos objetivo y los mismos 13 orígenes.
+  Excepción registrada (2026-11-02): los candidatos se declararon después de la réplica (nb 03,
+  Etapa 13) y antes de cualquier backtesting; la réplica no alimentó ninguna selección.
+- **SC-006**: El conjunto de modelos elegidos por artículo tiene un WRMSSE menor que el del
+  seasonal naive sobre los mismos productos objetivo y los mismos 13 orígenes.
 - **SC-007**: Cada modelo se evalúa en test exactamente una vez.
 - **SC-008**: Con el informe final, un analista identifica para cada producto objetivo su clase,
   su aporte al gasto estimado, su tratamiento y su pronóstico, sin consultar otra fuente.
@@ -433,7 +486,7 @@ mismo conjunto y los mismos 13 orígenes.
 ## Entregables
 
 - **Entregable 1 (esta especificación):** el RMV: matriz ABC × XYZ sobre train, lista objetivo con
-  tratamiento y pronóstico de participación a 28 días de los productos objetivo de clase A.
+  tratamiento y pronóstico de unidades a 28 días (por ratio entre bloques) de los productos objetivo de clase A.
 - **Entregable 2 (otra iteración, fuera de alcance):** cantidad sugerida de abastecimiento,
   desagregación artículo-tienda, clasificación SBC y extensión a todo el catálogo.
 
@@ -447,7 +500,6 @@ elegido supera al seasonal naive.
 - Modelar inventario o costos logísticos.
 - Calcular margen, rotación de inventario o gasto con costo real.
 - Construir tablero o interfaz.
-- Variables exógenas (ARIMAX/SARIMAX).
 - Pronosticar el total de la cadena.
 - Pronosticar a nivel artículo-tienda o extender a todo el catálogo.
 
@@ -468,11 +520,11 @@ elegido supera al seasonal naive.
 - **Bases de comparación:** año anterior y año 1 (FR-016). Para la réplica en el año 5, el año 4 y
   el año 1.
 - **Ponderación del WRMSSE:** sigue la definición de Makridakis et al. (2022), con pesos por gasto
-  estimado de los últimos 28 días de train y escala por el error naive de un paso en train.
+  estimado de los últimos 28 días de train (el último bloque) y escala por el error del seasonal
+  naive (m = 13 bloques) en la muestra.
 - **Pendientes que se resuelven en el plan o la experimentación:** valor del periodo de uso,
   umbral de kappa para leer la estabilidad, significado y cobertura de `wm_yr_wk`, forma de serialización,
-  redondeo al convertir participación a unidades, ventanas de medias móviles en días, tamaño del
-  subconjunto y candidatos de búsqueda, etiquetas de `selection_level` (nivel de selección del
-  modelo), y versiones de Python y librerías.
+  redondeo del pronóstico en unidades, rezagos y ventanas, espacios de búsqueda de boosting, y versiones de
+  Python y librerías.
 - **Referencias:** Makridakis et al. (2022) para WRMSSE; las fuentes para ABC-XYZ, umbrales y
   estabilidad se citan en el plan.
