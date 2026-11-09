@@ -2,19 +2,19 @@
 
 - La constitución (`.specify/memory/constitution.md`) prevalece sobre cualquier otra práctica.
 - Notebook canónico de la segmentación: `notebooks/03_abc_xyz_train.ipynb`.
-- **Notebook en curso: nb 04.** Registro de etapas y su estado:
-  `specs/001-abc-xyz-share-forecast/nb04-etapas.md`. Léelo al empezar y márcalo al cerrar cada
-  etapa.
-- **Notebook experimental en curso: nb 03b** (`notebooks/03b_tratamiento_por_tienda.ipynb`),
-  tratamiento por tienda; independiente del nb 04; solo persiste las entradas del 03c/03d y los puntos de
-  control de la búsqueda SARIMAX. Registro:
-  `specs/001-abc-xyz-share-forecast/nb03b-etapas.md`. Mismas reglas R1–R8.
-- **Notebook experimental en curso: nb 03c** (`notebooks/03c_tratamiento_por_tienda.ipynb`), búsqueda de
-  hiperparámetros del boosting con las entradas que exporta el 03b; persiste solo su búsqueda. Registro:
-  `specs/001-abc-xyz-share-forecast/nb03c-etapas.md`. Mismas reglas R1–R8.
-- **Notebook experimental en curso: nb 03d** (`notebooks/03d_seleccion_por_articulo.ipynb`), selección por
-  artículo entre seasonal naive, SARIMAX (03b) y CatBoost (03c); persiste solo `selection.csv`. Registro:
-  `specs/001-abc-xyz-share-forecast/nb03d-etapas.md`. Mismas reglas R1–R8.
+- **Flujo de modelado (constitución 7.0.0):** 03 → 03b (tratamiento por tienda y datasets) → 03c (búsqueda del
+  boosting) → 03d (diagnóstico de la selección) → 04 (reentrenamiento de CatBoost global) → 05 (test). Lo que guardan
+  el 03b, el 03c y el 03d se carga, no se recalcula; sus notebooks tienen candado (`RERUN`/`OVERWRITE`).
+- **Notebook en curso: nb 04** (`notebooks/04_feature_engineering_y_seleccion_de_modelo.ipynb`, nuevo). Registro:
+  `specs/001-abc-xyz-share-forecast/nb04-etapas.md`. Léelo al empezar y márcalo al cerrar cada etapa. El nb 04
+  anterior quedó como `..._superseded.ipynb`, sin uso (registro `nb04-superseded-etapas.md`).
+- **nb 03b** (`notebooks/03b_tratamiento_por_tienda.ipynb`): tratamiento por tienda; persiste los datasets y los
+  puntos de control SARIMAX. Registro: `specs/001-abc-xyz-share-forecast/nb03b-etapas.md`.
+- **nb 03c** (`notebooks/03c_tratamiento_por_tienda.ipynb`): búsqueda de hiperparámetros del boosting; persiste solo
+  su búsqueda. Registro: `specs/001-abc-xyz-share-forecast/nb03c-etapas.md`.
+- **nb 03d** (`notebooks/03d_seleccion_por_articulo.ipynb`): diagnóstico de la selección por artículo; persiste solo
+  `selection.csv`. Registro: `specs/001-abc-xyz-share-forecast/nb03d-etapas.md`.
+- Mismas reglas R1–R8 en todos.
 
 ## Reglas de trabajo por etapas (nb 04)
 
