@@ -1,5 +1,41 @@
 <!--
 Sync Impact Report
+- Version change: 6.2.0 → 7.0.0 (MAJOR, 2026-11-09)
+- Motivo del MAJOR (usuario): se redefinen reglas del Principio VI (NO NEGOCIABLE) y del VII: el
+  candidato pasa a ser un único CatBoost global, sin selección por artículo, y el tratamiento de
+  quiebres por tienda del nb 03b pasa a ser el oficial. Evidencia de la cadena 03b → 03c → 03d,
+  toda dentro de train (ningún resultado de test se ha visto):
+  - Tratamiento por tienda (nb 03b): bloques atípicos 143 → 31 (AX 6 → 0, AY 41 → 3, AZ 96 → 28)
+    frente al tratamiento por artículo del nb 04.
+  - Búsqueda (nb 03c, 100 pruebas por algoritmo, 13 folds): WRMSSE CatBoost 0,506 · XGBoost
+    0,507 · LightGBM 0,511 · seasonal naive 0,894. SARIMAX (nb 03b): 0,664.
+  - Selección (nb 03d, Etapa 4): eligiendo con los folds 1–7 y midiendo en los 8–13, la selección
+    por artículo da 0,517 y CatBoost para todos 0,483 (diferencia +0,033, IC 95 % bootstrap
+    [0,009; 0,056]); la selección por artículo pierde en AX, AY y AZ.
+- Modified principles:
+  - II. Reglas de dominio: nuevas reglas "Quiebres por tienda", "Rachas largas por tienda",
+    "Primer bloque incompleto", "Bloque atípico" y "Ratio tratado"; "Rachas improbables de ceros"
+    acota su efecto en la serie de pronóstico (los días se completan por tienda).
+  - VI. Método y congelamiento: candidato único CatBoost global con hiperparámetros congelados del
+    nb 03c; SARIMAX, XGBoost y LightGBM quedan documentados y sin uso; versiones canónicas del
+    tratamiento (nb 03b), de la búsqueda (nb 03c) y del diagnóstico de selección (nb 03d); régimen
+    de test con el modelo global; filas con ratio tratado fuera del ajuste.
+  - VII. Métricas y aceptación: se retira el filtro por artículo; modelo global sin selección por
+    artículo; pesos del WRMSSE = gasto en los últimos 13 bloques de train de cada artículo.
+- Modified sections: Stack tecnológico (SARIMAX y pmdarima solo en lo documentado); Flujo de
+  trabajo (03 → 03b → 03c → 03d → 04 → 05; el nb 04 solo reentrena; el nb 04 anterior queda como
+  `_superseded`, sin uso).
+- Removed sections: ninguna.
+- Impacto sobre artefactos congelados: `targets` (nb 03) no cambia; el filtro de alcance (rachas
+  largas con caída generalizada y ≥ 39 bloques) se aplica en el nb 03b y deja 517 artículos. No se
+  repite la matriz sobre train: la segmentación no cambia.
+- Artefactos por actualizar: spec.md, plan.md, data-model.md, tasks.md, params.toml (`[forecast]`:
+  candidatos), CLAUDE.md, los encabezados "experimental" de los nb 03b, 03c y 03d, el nb 04
+  (renombre a `_superseded` y nuevo nb 04) y sus registros de etapas.
+- Pendiente: aprobar las etapas abiertas (`[~]`) de los nb 03b, 03c y 03d, que pasan a ser
+  canónicos.
+
+Historial 6.2.0
 - Version change: 6.1.0 → 6.2.0 (MINOR, 2026-11-02)
 - Motivo: decisión del usuario en el nb 04 (Etapa 4.2, revisada tras la Etapa 11): un bloque que
   pasó `min_days` pero vende menos del 10 % de la mediana de sus últimos 6 bloques válidos es un
@@ -236,6 +272,35 @@ reposición, algo que esta etapa no valida.
   bloque anterior (bloques no válidos al inicio del ciclo de vida), se eliminan y la serie
   empieza en el primer bloque válido. Se miden todos los bloques de la ventana de backtesting y
   del test.
+- **Quiebres por tienda (nb 03b):** los quiebres se detectan por tienda × día, antes de sumar al
+  artículo, porque la suma esconde el quiebre cuando una tienda sigue vendiendo poco. Cada tienda
+  tiene su ciclo de vida desde su primera venta y su propio umbral de racha de ceros (mismo
+  criterio del Principio VI, α = 0,01, solo train). Un día de quiebre de una tienda toma la media de
+  sus 28 días válidos previos (causal: nunca usa días posteriores). Los días en que el artículo
+  entero quedó enmascarado (quiebre total) toman la suma de lo completado por tienda. La serie del
+  artículo es la suma de sus tiendas tratadas.
+- **Rachas largas por tienda:** racha larga = más de 6 bloques de 28 días de quiebre seguidos en
+  una tienda. Caída generalizada = al menos 9 de las 10 tiendas en racha larga a la vez durante al
+  menos 6 bloques: la historia del artículo empieza en el primer bloque completo tras la vuelta a
+  stock y, si quedan menos de 39 bloques, el artículo sale del modelado (filtro de alcance, no regla
+  de pronóstico). Una racha larga aislada se sigue completando como cualquier quiebre.
+- **Primer bloque incompleto:** el primer bloque con menos de 28 días con datos se quita, junto con
+  los bloques no válidos que lo copiaron, y la serie empieza en el siguiente bloque válido, salvo
+  que quitarlo deje menos de 39 bloques.
+- **Bloque atípico:** después de la suma, un bloque válido con unidades por debajo de
+  `atypical_level` (50 %) de la mediana de sus últimos 6 bloques válidos (mínimo
+  `atypical_min_ref` = 3) se completa si el mismo periodo no estuvo deprimido en los años
+  anteriores (`atypical_years` = 3; patrón si se repite en `atypical_pattern_years` = 2): toma la
+  mediana reciente × la mediana de los niveles de ese periodo en los años anteriores (tope 1), o el
+  bloque anterior si no hay año anterior. En la ventana de backtesting y en el test la regla es
+  causal: con días enmascarados el umbral es `atypical_level_masked` (80 %), y el bloque no válido
+  que sigue a uno por debajo de `atypical_refill_level` (80 %) toma la mediana reciente. En la
+  historia previa a la ventana, el bloque que causa un ratio extremo atípico se imputa con la
+  mediana de sus 6 bloques válidos previos. Estas reglas son solo a nivel artículo.
+- **Ratio tratado:** un ratio > `max_ratio` (2) queda vacío antes de calcular rezagos y ventanas;
+  en las primeras 7 posiciones del artículo también el ratio < `min_ratio_start` (0,5). La fila no
+  entrena el modelo, pero se pronostica y se mide. En las ventanas, el bloque tratado cuenta como
+  historia y su valor se omite.
 - **Calendario:** las fechas DEBEN ser válidas y continuas. Eventos y SNAP son variables
   conocidas de antemano.
 - **Prelanzamiento:** las semanas previas al lanzamiento de un artículo DEBEN excluirse del
@@ -243,9 +308,10 @@ reposición, algo que esta etapa no valida.
 - **Ceros en periodo activo:** son ambiguos (quiebre de stock o baja demanda). NO DEBEN
   interpretarse como quiebre sin evidencia externa.
 - **Rachas improbables de ceros:** una racha interna de ceros de largo igual o mayor que el
-  umbral del artículo (Principio VI) se trata como **no observada** (NaN) en el CV de XYZ y en la
-  serie de pronóstico. No se afirma su causa: se excluye porque es improbable como demanda de días
-  independientes. El resto de los ceros se conserva como demanda observada.
+  umbral del artículo (Principio VI) se trata como **no observada** (NaN) en el CV de XYZ. No se
+  afirma su causa: se excluye porque es improbable como demanda de días independientes. En la
+  serie de pronóstico esos días se completan con el tratamiento por tienda (quiebre total). El
+  resto de los ceros se conserva como demanda observada.
 - **Ciclo de vida en el pronóstico:** la serie de cada artículo va de su primera a su última
   venta; los ceros anteriores y posteriores no forman parte de la serie, igual que en la
   segmentación.
@@ -254,7 +320,8 @@ reposición, algo que esta etapa no valida.
 
 **Razón:** el gasto con precio por tienda-semana y la exclusión del prelanzamiento evitan sesgos
 en ABC y en el CV que alterarían la clasificación. Las rachas improbables de ceros inflan el CV y
-enseñan al modelo una demanda nula que no se observó.
+enseñan al modelo una demanda nula que no se observó. Tratar los quiebres por tienda antes de sumar
+reduce los bloques atípicos de 143 a 31 frente al tratamiento por artículo (nb 03b).
 
 ### III. Estilo de código, parámetros y abstracciones
 
@@ -359,12 +426,15 @@ sin dejar rastro.
   anual. El fold k entrena con todo lo anterior a la validación más los bloques 1 a k − 1 de la
   validación y predice el bloque k (h = 1); nunca se entrena con el bloque que se predice. Se reentrena en cada fold. Una configuración de hiperparámetros se evalúa por su error
   promedio en los 13 folds, nunca por un fold aislado. El boosting no usa early stopping: la
-  cantidad de árboles (`n_estimators`) es un hiperparámetro más de la búsqueda. Los órdenes SARIMAX se eligen una vez (AIC) con los bloques
-  anteriores a la validación y sus coeficientes se reestiman en cada fold.
-- **Candidatos de pronóstico:** seasonal naive (única línea base), SARIMAX y boosting global
-  (XGBoost, LightGBM y CatBoost, con `item_id` y `cell` como variables). Se declaran antes del
-  backtesting. La réplica en el año 5 (nb 03, Etapa 13) se hizo antes de esta declaración y no
-  alimenta ninguna selección.
+  cantidad de árboles (`n_estimators`) es un hiperparámetro más de la búsqueda. Las filas con ratio
+  tratado (Principio II) no entrenan en ningún fold, pero se pronostican y se miden.
+- **Candidato de pronóstico:** un único **CatBoost global** para todos los artículos (`item_id`,
+  `cell` y `period` como categóricas), con los hiperparámetros congelados de la mejor prueba de la
+  búsqueda del nb 03c (prueba 43 de 100; WRMSSE 0,506 en los 13 folds), guardados en
+  `data/interim/nb03c_boosting/catboost_backtest.pkl`. El seasonal naive es la única línea base.
+  SARIMAX (nb 03b), XGBoost y LightGBM (nb 03c) se evaluaron con el mismo backtesting; quedan
+  documentados y no se usan. La réplica en el año 5 (nb 03, Etapa 13) se hizo antes de declarar
+  los candidatos y no alimenta ninguna selección.
 - **Réplica en el año 5:** una vez congelados la lista objetivo y su tratamiento, y declarados
   los candidatos de pronóstico y el nivel de selección del modelo, se replica sobre el año 5 la
   matriz ABC × XYZ y la estabilidad con los cortes, umbrales y agregación congelados. Es solo
@@ -382,13 +452,18 @@ sin dejar rastro.
 - **Versión canónica de la segmentación:** `notebooks/03_abc_xyz_train.ipynb`, por etapas
   auditables. Sus cortes, reglas y la lista de artículos para modelado son los que se congelan; lo
   que el flujo anterior exportaba o congelaba y el nb 03 no produce deja de tomarse en cuenta.
+- **Versiones canónicas del modelado:** el tratamiento por tienda y los datasets de modelado son los
+  del nb 03b (`data/interim/nb03b_datasets/`, 517 artículos); la búsqueda de hiperparámetros, la del
+  nb 03c (`data/interim/nb03c_boosting/`); el diagnóstico de la selección, el del nb 03d
+  (`data/interim/nb03d_selection/selection.csv`). Lo que guardan se carga y NO se recalcula; sus
+  notebooks tienen un candado que impide reemplazarlo sin permiso explícito.
 - Una vez seleccionados, todos los elementos quedan congelados. El test se evalúa una sola vez
   por modelo.
 - Ningún parámetro se cambia después de ver resultados de test. Un cambio posterior a la
   congelación exige una nueva versión y repetir desde la matriz sobre train.
-- En test se repite el régimen del backtesting: en cada uno de los 13 orígenes el modelo elegido
-  por artículo se reentrena con todo lo observado hasta ese origen, con hiperparámetros y órdenes
-  congelados. Ninguna selección se repite con datos de test.
+- En test se repite el régimen del backtesting: en cada uno de los 13 orígenes el CatBoost global
+  se reentrena con todo lo observado hasta ese origen, con los hiperparámetros congelados, y se
+  compara con el seasonal naive. Ninguna selección se repite con datos de test.
 
 **Razón:** cualquier uso del año 5 en una decisión filtra información del test e invalida la
 evaluación.
@@ -401,21 +476,27 @@ evaluación.
 - **MAPE:** fuera del criterio de aceptación.
 - **RMSSE por artículo:** escala = error del seasonal naive dentro de la muestra (m = 13 bloques).
 - **Línea base obligatoria:** seasonal naive (ŷ_t = y_{t−13}, bloques de 28 días).
-- **Filtro por artículo:** un candidato compite solo si su error en las ventanas de validación es
-  menor que el del seasonal naive en esas mismas ventanas; entre los que pasan gana el de menor
-  error, y si ninguno pasa el artículo usa el seasonal naive.
-- **Aceptación agregada:** el conjunto elegido DEBE tener un WRMSSE menor que el del seasonal naive.
+- **Pesos del WRMSSE:** gasto de cada artículo en sus últimos 13 bloques de train (nunca test).
+- **Modelo global, sin selección por artículo:** todos los artículos usan el CatBoost global. El
+  filtro por artículo frente al seasonal naive (versiones 3.0.0 a 6.2.0) se retira: eligiendo con
+  los folds 1–7 y midiendo en los 8–13, la selección por artículo dio un WRMSSE de 0,517 frente a
+  0,483 de CatBoost para todos (IC 95 % de la diferencia [0,009; 0,056], nb 03d, Etapa 4). La
+  selección por artículo se conserva solo como diagnóstico en el nb 03d.
+- **Aceptación agregada:** el CatBoost global DEBE tener un WRMSSE menor que el del seasonal naive,
+  en el backtesting (0,506 frente a 0,894) y en el test.
 - **MAE:** diagnóstico, sin umbral.
 
 **Razón:** WRMSSE es la métrica de referencia de M5 y es robusta a series intermitentes, donde
-MAPE no está definido o se distorsiona.
+MAPE no está definido o se distorsiona. Con 13 bloques por artículo, elegir entre varios modelos
+agrega más ruido que señal: el ganador de cada artículo sale optimista y no se sostiene en bloques
+nuevos.
 
 ## Stack tecnológico
 
 - Lenguaje: Python (`requires-python = "~=3.12.0"` en `pyproject.toml`).
-- Librerías: pandas, NumPy, scikit-learn, statsmodels (SARIMAX), pmdarima (o búsqueda AIC propia
-  con statsmodels si no es compatible), XGBoost, LightGBM, CatBoost, Optuna y herramientas de
-  visualización habituales (matplotlib, seaborn, plotly).
+- Librerías: pandas, NumPy, scikit-learn, CatBoost y Optuna para el modelo; statsmodels (SARIMAX),
+  XGBoost y LightGBM solo en lo documentado (nb 03b y 03c); herramientas de visualización
+  habituales (matplotlib, seaborn, plotly).
 - Las versiones DEBEN estar fijadas en el entorno y registradas en el repositorio
   (`pyproject.toml` y `uv.lock`).
 
@@ -425,9 +506,14 @@ MAPE no está definido o se distorsiona.
   verificable.
 - **Orden de etapas (obligatorio):** validación de datos → exploración descriptiva de cinco años
   → matriz ABC × XYZ sobre train → estabilidad y lista objetivo (congeladas) → declaración de
-  candidatos de pronóstico → réplica en el año 5 → backtesting en train → evaluación única en
-  test → informe final. El nb 04 cierra con la selección por artículo y el reentrenamiento de los
-  ganadores con los años 1–4; la evaluación en test (13 orígenes del año 5) es del nb 05.
+  candidatos de pronóstico → réplica en el año 5 → tratamiento por tienda y datasets (nb 03b) →
+  búsqueda de hiperparámetros con backtesting en train (nb 03c) → diagnóstico de la selección
+  (nb 03d) → reentrenamiento (nb 04) → evaluación única en test (nb 05) → informe final.
+- El nb 04 carga los datasets del nb 03b y los hiperparámetros del nb 03c y reentrena el CatBoost
+  global con todo el train (años 1–4, incluida la ventana de backtesting), sin ninguna búsqueda.
+  La evaluación en test (13 orígenes) es del nb 05. El nb 04 anterior (tratamiento por artículo,
+  579 artículos) queda como `04_feature_engineering_y_seleccion_de_modelo_superseded.ipynb`, sin
+  uso.
 - El RMV se cierra cuando el ranking ABC × XYZ y el pronóstico de clase A cumplen los criterios
   de aceptación de la especificación.
 - Todo plan (`/speckit-plan`) DEBE pasar una verificación de cumplimiento contra los Principios
@@ -446,4 +532,4 @@ MAPE no está definido o se distorsiona.
   la centralización de parámetros, el registro de rechazos, el aislamiento del test y la
   justificación escrita de cada abstracción.
 
-**Version**: 6.2.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-11-02
+**Version**: 7.0.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-11-09
