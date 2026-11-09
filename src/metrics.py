@@ -182,3 +182,121 @@ def wrmsse_frame(df: pd.DataFrame, pred_col: str, scales: pd.Series, weights: pd
         y[item] = g[actual_col].to_numpy(float)
         y_hat[item] = g[pred_col].to_numpy(float)
     return wrmsse(y, y_hat, scales.to_dict(), weights.to_dict())
+
+
+def train_weight_windows(blocks: pd.DataFrame, day_of: pd.Series, n_blocks: int, block_days: int) -> dict:
+    """Ventana de pesos de cada artículo: sus últimos `n_blocks` bloques de train (días inclusive).
+
+    Es la regla del nb 03c (usuario, 2026-11-06): con un año ningún artículo queda con peso 0 por
+    un quiebre puntual, y cada artículo usa su propio último año de train (nunca test).
+
+    Parámetros:
+        blocks (pd.DataFrame): una fila por artículo y bloque, con `item_id`, `split` y
+            `start_date`.
+        day_of (pd.Series): fecha → número de día d.
+        n_blocks (int): bloques de la ventana.
+        block_days (int): días por bloque.
+
+    Retorno:
+        dict: artículo (str) → (primer día, último día).
+    """
+    train = blocks[blocks["split"] == "train"]
+    starts = train.groupby(train["item_id"].astype(str))["start_date"]
+    out = {}
+    for item, s in starts:
+        s = s.sort_values()
+        if len(s) < n_blocks:
+            raise ValueError(f"{item}: {len(s)} bloques de train, se piden {n_blocks}")
+        out[item] = (int(day_of[s.iloc[-n_blocks]]), int(day_of[s.iloc[-1]]) + block_days - 1)
+    return out
+
+
+def item_errors(window: pd.DataFrame, candidates: list[str], scales: pd.Series,
+                actual_col: str = "units") -> pd.DataFrame:
+    """Error de cada candidato por artículo en los bloques de la tabla (nb 03d, Etapa 2).
+
+    Parámetros:
+        window (pd.DataFrame): una fila por artículo y bloque, con `item_id`, `actual_col` y una
+            columna de pronóstico por candidato (NaN si el artículo no tiene ese modelo).
+        candidates (list[str]): columnas de pronóstico.
+        scales (pd.Series): escala del RMSSE por artículo.
+
+    Retorno:
+        pd.DataFrame: una fila por artículo y candidato con `n_blocks` (pares válidos), `rmsse`,
+        `wape`, `mae` y las sumas `abs_error` y `units` (para agregar el WAPE). Un artículo sin
+        pronóstico de un candidato no tiene fila para ese candidato.
+    """
+    rows = []
+    for item, g in window.groupby(window["item_id"].astype(str)):
+        for cand in candidates:
+            y, y_hat = _valid(g[actual_col].to_numpy(float), g[cand].to_numpy(float))
+            if not len(y):
+                continue
+            abs_error = np.abs(y - y_hat)
+            rows.append({"item_id": item, "candidate": cand, "n_blocks": len(y),
+                         "rmsse": rmsse(y, y_hat, float(scales.get(item, 0.0))), "wape": wape(y, y_hat),
+                         "mae": float(abs_error.mean()), "abs_error": float(abs_error.sum()),
+                         "units": float(np.abs(y).sum())})
+    return pd.DataFrame(rows)
+
+
+def segment_errors(errors: pd.DataFrame, weights: pd.Series, segment: pd.Series) -> pd.DataFrame:
+    """WRMSSE y WAPE por candidato y segmento, más el total, desde `item_errors`.
+
+    WRMSSE: promedio de los RMSSE con los pesos renormalizados dentro del grupo (como `wrmsse`:
+    sin RMSSE válido o peso no positivo, el artículo no entra). WAPE: Σ|e| / Σy del grupo, que
+    pondera por unidades.
+
+    Parámetros:
+        errors (pd.DataFrame): salida de `item_errors`.
+        weights (pd.Series): peso por artículo.
+        segment (pd.Series): segmento por artículo (p. ej. `cell`).
+
+    Retorno:
+        pd.DataFrame: índice (`candidate`, `segment`) con `n_items`, `wrmsse` y `wape`; el
+        segmento `total` junta todos los artículos.
+    """
+    df = errors.assign(weight=errors["item_id"].map(weights).astype(float),
+                       segment=errors["item_id"].map(segment).astype(str))
+    df = pd.concat([df, df.assign(segment="total")])
+
+    def summary(g: pd.DataFrame) -> pd.Series:
+        ok = g["rmsse"].notna() & (g["weight"] > 0)
+        w = g.loc[ok, "weight"]
+        return pd.Series({"n_items": len(g),
+                          "wrmsse": float(np.dot(w / w.sum(), g.loc[ok, "rmsse"])) if ok.any() else np.nan,
+                          "wape": g["abs_error"].sum() / g["units"].sum() if g["units"].sum() > 0 else np.nan})
+
+    out = df.groupby(["candidate", "segment"], sort=False)[["rmsse", "weight", "abs_error", "units"]].apply(summary)
+    out["n_items"] = out["n_items"].astype(int)
+    return out
+
+
+def paired_bootstrap_wrmsse(rmsse_a: pd.Series, rmsse_b: pd.Series, weights: pd.Series, n_boot: int,
+                            seed: int, level: float = 0.95) -> dict:
+    """Intervalo bootstrap pareado de WRMSSE(a) − WRMSSE(b), remuestreando artículos.
+
+    Cada réplica sortea artículos con reemplazo y recalcula los dos WRMSSE con los mismos
+    artículos (pareado), con los pesos renormalizados en la réplica.
+
+    Parámetros:
+        rmsse_a, rmsse_b (pd.Series): RMSSE por artículo de cada alternativa (mismo índice).
+        weights (pd.Series): peso por artículo.
+        n_boot (int): réplicas.
+        seed (int): semilla.
+        level (float): nivel del intervalo de percentiles.
+
+    Retorno:
+        dict: `diff` (diferencia observada), `low`, `high` y `p_a_not_better` (fracción de
+        réplicas con diferencia ≥ 0).
+    """
+    items = rmsse_a.index
+    if not items.equals(rmsse_b.index) or rmsse_a.isna().any() or rmsse_b.isna().any():
+        raise ValueError("las dos alternativas deben tener RMSSE en los mismos artículos")
+    w = weights.reindex(items).to_numpy(float)
+    d = (rmsse_a - rmsse_b).to_numpy(float)
+    idx = np.random.default_rng(seed).integers(0, len(items), size=(n_boot, len(items)))
+    boot = (w[idx] * d[idx]).sum(axis=1) / w[idx].sum(axis=1)
+    tail = (1 - level) / 2
+    return {"diff": float(np.dot(w, d) / w.sum()), "low": float(np.quantile(boot, tail)),
+            "high": float(np.quantile(boot, 1 - tail)), "p_a_not_better": float(np.mean(boot >= 0))}
