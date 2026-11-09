@@ -50,3 +50,8 @@ Al cerrar una etapa se anotan la fecha y las funciones agregadas o modificadas e
   recalculan al correr. Antes de cada búsqueda (3.2, 4.2, 5.2) se imprimen los artículos, las filas, la fecha de la
   exportación y el estudio, para validar el conjunto cargado; el número de artículos no va en la configuración del
   estudio (no es un hiperparámetro, usuario). Sin cambios en `src/`.
+
+- [~] **Candado y guardado protegido** (2026-11-09, usuario). Celda tras la configuración: `guard_rerun` detiene el
+  notebook si sus salidas existen, salvo `RERUN = True`; el guardado no reemplaza contenido distinto salvo
+  `OVERWRITE = True` (si es igual, no escribe). No cambia ningún resultado. `src/data.py`: `guard_rerun`, `save_pickle`,
+  `_same_content` (nuevas), `save_tables` (`overwrite`) y sus tests en `src/tests/test_data.py`.

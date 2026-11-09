@@ -75,3 +75,8 @@ Al cerrar una etapa se anotan la fecha y las funciones agregadas o modificadas e
   `sarimax_differencing`, `fit_sarimax`, `sarimax_order_grid`, `sarimax_one_step`, `select_sarimax_item`,
   `search_sarimax_orders`, `sarimax_backtest_item`, `seasonal_acf`, `search_sarimax_checkpointed`, `load_sarimax_checkpoints`,
   `_search_item`, `_combine_search`, `_read_batches` (nuevas) y sus tests en `src/tests/test_modeling.py`.
+
+- [~] **Candado y guardado protegido** (2026-11-09, usuario). Celda tras la configuración: `guard_rerun` detiene el
+  notebook si sus salidas existen, salvo `RERUN = True`; el guardado no reemplaza contenido distinto salvo
+  `OVERWRITE = True` (si es igual, no escribe). No cambia ningún resultado. `src/data.py`: `guard_rerun`, `save_pickle`,
+  `_same_content` (nuevas), `save_tables` (`overwrite`) y sus tests en `src/tests/test_data.py`.

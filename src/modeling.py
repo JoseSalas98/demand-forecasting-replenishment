@@ -688,3 +688,90 @@ def boosting_search(data: pd.DataFrame, features: list[str], algorithm: str, spa
     if n_trials > done:
         study.optimize(objective, n_trials=n_trials - done, show_progress_bar=progress)
     return study
+
+
+def window_forecasts(base: pd.DataFrame, forecasts: dict) -> pd.DataFrame:
+    """Junta en una tabla los pronósticos de la ventana de backtesting de varios candidatos.
+
+    Parámetros:
+        base (pd.DataFrame): una fila por artículo y bloque de la ventana, con `item_id`, `block`,
+            `fold` y `units` (p. ej. `snaive_valid` del nb 03b, que trae el seasonal naive).
+        forecasts (dict): nombre del candidato → tabla con `item_id`, `block`, `units` y una
+            columna con ese nombre (pronóstico en unidades; NaN si el artículo no tiene modelo).
+
+    Retorno:
+        pd.DataFrame: `base` con una columna por candidato, mismas filas y orden.
+
+    Raises:
+        ValueError: si un candidato tiene filas repetidas, filas fuera de `base`, le faltan filas
+            o sus unidades reales no coinciden con las de `base`.
+    """
+    out = base.assign(item_id=base["item_id"].astype(str)).reset_index(drop=True)
+    for name, df in forecasts.items():
+        f = df[["item_id", "block", "units", name]].assign(item_id=df["item_id"].astype(str))
+        if f.duplicated(["item_id", "block"]).any():
+            raise ValueError(f"{name}: filas repetidas por artículo y bloque")
+        merged = out[["item_id", "block", "units"]].merge(f, on=["item_id", "block"], how="left",
+                                                          suffixes=("", "_cand"), indicator=True)
+        if (merged["_merge"] != "both").any() or len(f) != len(out):
+            raise ValueError(f"{name}: no tiene exactamente las filas de la ventana")
+        if not np.allclose(merged["units"], merged["units_cand"], equal_nan=True):
+            raise ValueError(f"{name}: las unidades reales no coinciden con las de la base")
+        out[name] = merged[name].to_numpy(float)
+    return out
+
+
+def select_by_item(errors: pd.DataFrame, order: list[str], metric: str = "rmsse") -> pd.DataFrame:
+    """Elige el modelo de cada artículo con el filtro de la constitución (Principio VII).
+
+    `order[0]` es la línea base. Un candidato compite solo si su error es estrictamente menor que
+    el de la línea base; entre los que pasan gana el de menor error, y si ninguno pasa gana la
+    línea base. `order` va del más simple al más complejo: con empate exacto gana el más simple.
+
+    Parámetros:
+        errors (pd.DataFrame): una fila por artículo y candidato con `item_id`, `candidate` y
+            `metric` (p. ej. `item_errors`); un candidato sin fila no compite en ese artículo.
+        order (list[str]): candidatos, la línea base primero.
+        metric (str): columna con la que se elige.
+
+    Retorno:
+        pd.DataFrame: una fila por artículo con el error de cada candidato (NaN si no tiene),
+        `winner` y `winner_<metric>`.
+
+    Raises:
+        ValueError: si algún artículo no tiene error de la línea base.
+    """
+    wide = errors.pivot(index="item_id", columns="candidate", values=metric).reindex(columns=order)
+    if wide[order[0]].isna().any():
+        raise ValueError(f"hay artículos sin error de la línea base {order[0]}")
+    winner = pd.Series(order[0], index=wide.index)
+    best = wide[order[0]].copy()
+    for cand in order[1:]:
+        better = wide[cand] < best   # estricto: empate → se queda el anterior (más simple); NaN no compite
+        winner[better], best[better] = cand, wide.loc[better, cand]
+    return wide.assign(winner=winner, **{f"winner_{metric}": best}).reset_index().rename_axis(columns=None)
+
+
+def selected_forecast(window: pd.DataFrame, winner: pd.Series) -> np.ndarray:
+    """Pronóstico del modelo elegido en cada fila de la ventana.
+
+    Parámetros:
+        window (pd.DataFrame): con `item_id` y una columna por candidato.
+        winner (pd.Series): artículo → nombre del candidato elegido.
+
+    Retorno:
+        np.ndarray: pronóstico de la columna del ganador de cada artículo, fila a fila.
+
+    Raises:
+        ValueError: si a un artículo le falta ganador o el ganador no tiene pronóstico en alguna fila.
+    """
+    chosen = window["item_id"].astype(str).map(winner)
+    if chosen.isna().any():
+        raise ValueError("hay artículos de la ventana sin ganador")
+    out = np.full(len(window), np.nan)
+    for cand in chosen.unique():
+        rows = (chosen == cand).to_numpy()
+        out[rows] = window.loc[rows, cand].to_numpy(float)
+    if np.isnan(out).any():
+        raise ValueError("el modelo elegido no tiene pronóstico en alguna fila")
+    return out
