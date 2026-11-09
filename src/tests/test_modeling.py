@@ -303,3 +303,58 @@ def test_suggest_params_kinds():
     assert 0.1 <= p["d"] <= 0.9 and 0.01 <= p["e"] <= 1.0
     with pytest.raises(ValueError, match="tipo desconocido"):
         suggest_params(trial, {"x": ("cat", 0, 1)})
+
+
+def _window_base():
+    return pd.DataFrame({"item_id": ["A", "A", "B", "B"], "block": [1, 2, 1, 2], "fold": [1, 2, 1, 2],
+                         "units": [10.0, 12.0, 5.0, 7.0], "snaive": [9.0, 11.0, 6.0, 6.0]})
+
+
+def test_window_forecasts_aligns_candidates():
+    from src.modeling import window_forecasts
+    base = _window_base()
+    cand = pd.DataFrame({"item_id": ["B", "B", "A", "A"], "block": [2, 1, 2, 1], "units": [7.0, 5.0, 12.0, 10.0],
+                         "m1": [7.5, np.nan, 12.5, 10.5]})
+    out = window_forecasts(base, {"m1": cand})
+    np.testing.assert_array_equal(out["m1"].to_numpy(), [10.5, 12.5, np.nan, 7.5])   # orden de la base; NaN se conserva
+    assert list(out.columns) == list(base.columns) + ["m1"]
+
+
+@pytest.mark.parametrize("change", ["missing", "units", "duplicate"])
+def test_window_forecasts_rejects_mismatch(change):
+    from src.modeling import window_forecasts
+    cand = _window_base().drop(columns=["snaive", "fold"]).assign(m1=1.0)
+    if change == "missing":
+        cand = cand.iloc[:3]
+    elif change == "units":
+        cand.loc[0, "units"] = 99.0
+    else:
+        cand = pd.concat([cand.iloc[:3], cand.iloc[[0]]])
+    with pytest.raises(ValueError):
+        window_forecasts(_window_base(), {"m1": cand})
+
+
+def test_select_by_item_filter_tie_and_missing():
+    from src.modeling import select_by_item
+    errors = pd.DataFrame({
+        "item_id": ["A"] * 3 + ["B"] * 3 + ["C"] * 3 + ["D"] * 2,
+        "candidate": ["base", "m1", "m2"] * 3 + ["base", "m2"],
+        "rmsse": [1.0, 0.8, 0.6,    # A: gana m2 (el menor)
+                  0.5, 0.7, 0.9,    # B: nadie le gana a la base
+                  1.0, 0.7, 0.7,    # C: empate m1 = m2 → el más simple
+                  1.0, 1.2],        # D: sin m1; m2 no pasa el filtro
+    })
+    out = select_by_item(errors, ["base", "m1", "m2"]).set_index("item_id")
+    assert out["winner"].to_dict() == {"A": "m2", "B": "base", "C": "m1", "D": "base"}
+    assert out["winner_rmsse"].to_dict() == {"A": 0.6, "B": 0.5, "C": 0.7, "D": 1.0}
+    assert np.isnan(out.loc["D", "m1"])
+    with pytest.raises(ValueError):
+        select_by_item(errors[errors["candidate"] != "base"], ["base", "m1", "m2"])
+
+
+def test_selected_forecast_takes_winner_column():
+    from src.modeling import selected_forecast
+    window = _window_base().assign(m1=[1.0, 2.0, np.nan, np.nan])
+    np.testing.assert_array_equal(selected_forecast(window, pd.Series({"A": "m1", "B": "snaive"})), [1, 2, 6, 6])
+    with pytest.raises(ValueError):
+        selected_forecast(window, pd.Series({"A": "m1", "B": "m1"}))   # B no tiene m1
