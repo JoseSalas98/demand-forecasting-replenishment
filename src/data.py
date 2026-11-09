@@ -398,6 +398,62 @@ def save_interim(arrays: dict, tables: dict) -> None:
         df.to_parquet(INTERIM_DIR / f"{name}.parquet", index=False)
 
 
+def save_tables(out_dir, tables: dict, manifest: dict | None = None) -> list[Path]:
+    """Guarda varias tablas en Parquet en `out_dir`, con un `manifest.json` que las describe.
+
+    Parquet conserva Int64 con nulos y str. Las columnas category (con sus categorías y si son
+    ordenadas) se anotan en el manifiesto y `load_tables` las restaura: Parquet devuelve como
+    int64 una category de enteros.
+
+    Parámetros:
+        out_dir: carpeta de destino (se crea si no existe).
+        tables (dict): nombre → pd.DataFrame.
+        manifest (dict | None): datos extra para el manifiesto (listas de variables, parámetros).
+
+    Retorno:
+        list[Path]: rutas escritas (las tablas y el manifiesto).
+    """
+    import json
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    paths = []
+    for name, df in tables.items():
+        path = out_dir / f"{name}.parquet"
+        df.to_parquet(path, index=False)
+        paths.append(path)
+    categories = {name: {c: {"categories": df[c].cat.categories.tolist(), "ordered": bool(df[c].cat.ordered)}
+                         for c in df.columns if isinstance(df[c].dtype, pd.CategoricalDtype)}
+                  for name, df in tables.items()}
+    meta = {"saved_at": pd.Timestamp.now().isoformat(timespec="seconds"),
+            "tables": {name: list(df.shape) for name, df in tables.items()}, "categories": categories,
+            **(manifest or {})}
+    path = out_dir / "manifest.json"
+    path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return paths + [path]
+
+
+def load_tables(out_dir) -> tuple[dict, dict]:
+    """Lee las tablas que escribió `save_tables`, restaura sus columnas category y comprueba sus
+    dimensiones con el manifiesto.
+
+    Retorno:
+        tuple[dict, dict]: nombre → pd.DataFrame y el manifiesto.
+    """
+    import json
+
+    out_dir = Path(out_dir)
+    manifest = json.loads((out_dir / "manifest.json").read_text(encoding="utf-8"))
+    tables = {name: pd.read_parquet(out_dir / f"{name}.parquet") for name in manifest["tables"]}
+    for name, cols in manifest.get("categories", {}).items():
+        for c, spec in cols.items():
+            tables[name][c] = tables[name][c].astype(pd.CategoricalDtype(spec["categories"], ordered=spec["ordered"]))
+    for name, shape in manifest["tables"].items():
+        if list(tables[name].shape) != shape:
+            raise ValueError(f"{name}: {tables[name].shape} en disco, {tuple(shape)} en el manifiesto")
+    return tables, manifest
+
+
 def interim_from_aggregate(agg: dict) -> tuple[dict, dict]:
     """Separa un agregado en arreglos y tablas para `save_interim`.
 
