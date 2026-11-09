@@ -6,8 +6,15 @@
   `specs/001-abc-xyz-share-forecast/nb04-etapas.md`. Léelo al empezar y márcalo al cerrar cada
   etapa.
 - **Notebook experimental en curso: nb 03b** (`notebooks/03b_tratamiento_por_tienda.ipynb`),
-  tratamiento por tienda; independiente del nb 04, no persiste nada. Registro:
+  tratamiento por tienda; independiente del nb 04; solo persiste las entradas del 03c/03d y los puntos de
+  control de la búsqueda SARIMAX. Registro:
   `specs/001-abc-xyz-share-forecast/nb03b-etapas.md`. Mismas reglas R1–R8.
+- **Notebook experimental en curso: nb 03c** (`notebooks/03c_tratamiento_por_tienda.ipynb`), búsqueda de
+  hiperparámetros del boosting con las entradas que exporta el 03b; persiste solo su búsqueda. Registro:
+  `specs/001-abc-xyz-share-forecast/nb03c-etapas.md`. Mismas reglas R1–R8.
+- **Notebook experimental en curso: nb 03d** (`notebooks/03d_seleccion_por_articulo.ipynb`), selección por
+  artículo entre seasonal naive, SARIMAX (03b) y CatBoost (03c); persiste solo `selection.csv`. Registro:
+  `specs/001-abc-xyz-share-forecast/nb03d-etapas.md`. Mismas reglas R1–R8.
 
 ## Reglas de trabajo por etapas (nb 04)
 
