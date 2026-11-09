@@ -217,3 +217,23 @@ def test_sales_overview_counts_domain_violations():
     assert out["non_integer_cells"] == 1
     assert out["zero_cells"] == 1
     assert out["total_units"] == 5.5
+
+
+def test_save_and_load_tables_keep_dtypes(tmp_path):
+    from src.data import load_tables, save_tables
+    df = pd.DataFrame({
+        "item_id": pd.Categorical(["A", "B", "A"]),
+        "period": pd.Categorical([1, 2, 13], categories=list(range(1, 14)), ordered=True),
+        "fold": pd.array([0, 1, pd.NA], dtype="Int64"),
+        "ratio": [1.0, np.nan, 0.5],
+        "name": pd.Series(["x", "y", "z"], dtype="str"),
+    })
+    save_tables(tmp_path / "out", {"data": df}, {"features": ["ratio"]})
+    tables, manifest = load_tables(tmp_path / "out")
+    pd.testing.assert_frame_equal(tables["data"], df)
+    assert manifest["tables"] == {"data": [3, 5]} and manifest["features"] == ["ratio"]
+    (tmp_path / "out" / "data.parquet").unlink()
+    save_tables(tmp_path / "other", {"data": df.head(2)})
+    (tmp_path / "other" / "data.parquet").rename(tmp_path / "out" / "data.parquet")
+    with pytest.raises(ValueError, match="manifiesto"):
+        load_tables(tmp_path / "out")
