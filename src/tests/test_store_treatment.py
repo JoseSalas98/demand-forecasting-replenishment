@@ -4,9 +4,12 @@ import pytest
 
 from src.store_treatment import (
     add_store_fill,
+    cut_item_bounds,
+    exclude_long_runs,
     extreme_blocks,
     fill_store_breaks,
     flag_store_breaks,
+    long_break_runs,
     store_block_summary,
     store_units,
     store_zero_thresholds,
@@ -140,3 +143,40 @@ def test_share_deficit_test_flags_low_store_and_uses_others():
     assert t2.empty
     daily = spread_block_extra(_frame(np.zeros((3, 140)), stores=list(idx)), fixed - u)
     assert np.isclose(daily.iloc[0, 112:].sum(), 90.0) and daily.iloc[0, :112].sum() == 0
+
+
+def _breaks(units, spans):
+    b = pd.DataFrame(0, index=units.index, columns=units.columns, dtype=np.int8)
+    for r, s, e in spans:
+        b.iloc[r, s:e] = 1
+    return b
+
+
+def test_long_break_runs_generalized_cut_and_isolated_exclusion():
+    # 3 tiendas, 10 bloques (280 días); la ventana empieza en el día 197 (bloque 8).
+    u = _frame(np.ones((3, 280)))
+    # Tiendas 0 y 1 a la vez en los días 20–89 (70 días): caída generalizada con 2 tiendas y racha > 56.
+    # Tienda 2: racha aislada en la historia (días 100–169) y otra que cruza a la ventana (días 180–279).
+    brk = _breaks(u, [(0, 20, 90), (1, 20, 90), (2, 100, 170), (2, 180, 280)])
+    runs, cuts = long_break_runs(brk, pd.Series({"I1": 197}), min_days=56, chain_stores=2)
+    assert len(runs) == 4 and (runs["kind"] == ["generalizada", "generalizada", "aislada", "aislada"]).all()
+    assert cuts["cut_d"].tolist() == [113] and not cuts["no_return"].any()  # día 91 → primer bloque completo: día 113
+    iso = runs[runs["kind"] == "aislada"].set_index("start_d")
+    assert iso.loc[101, "excl_start_d"] == 101          # termina antes de la ventana: toda la racha
+    # Cruza a la ventana: al cierre del bloque 7 (día 196) mide 16; del 8 (día 224), 44; del 9 (día 252), 72 > 56.
+    assert iso.loc[181, "excl_start_d"] == 225
+    units_x, breaks_x = exclude_long_runs(u, brk, runs)
+    assert units_x.iloc[2, 100:170].isna().all() and units_x.iloc[2, 224:].isna().all()
+    assert (units_x.iloc[2, 180:224] == 1).all() and (breaks_x.iloc[2, 180:224] == 1).all()  # se completan
+    assert (breaks_x.iloc[2, 224:] == 0).all() and units_x.iloc[0].notna().all()            # generalizada: intacta
+    bounds = pd.DataFrame({"first_sale_d": [1.0], "last_sale_d": [280.0]}, index=pd.Index(["I1"], name="item_id"))
+    assert cut_item_bounds(bounds, cuts).loc["I1", "first_sale_d"] == 113
+
+
+def test_long_break_runs_no_return_drops_item():
+    u = _frame(np.ones((2, 112)))
+    brk = _breaks(u, [(0, 40, 112), (1, 40, 112)])
+    runs, cuts = long_break_runs(brk, pd.Series({"I1": 85}), min_days=28, chain_stores=2)
+    assert cuts["no_return"].all() and cuts["cut_d"].isna().all()
+    bounds = pd.DataFrame({"first_sale_d": [1.0], "last_sale_d": [112.0]}, index=pd.Index(["I1"], name="item_id"))
+    assert cut_item_bounds(bounds, cuts).empty
