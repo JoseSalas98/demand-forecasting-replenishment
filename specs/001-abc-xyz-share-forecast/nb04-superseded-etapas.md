@@ -1,6 +1,8 @@
-# nb 04 · Registro de etapas
+# nb 04 (superseded) · Registro de etapas
 
-Notebook: `notebooks/04_feature_engineering_y_seleccion_de_modelo.ipynb`.
+> **Superseded (constitución 7.0.0, 2026-11-09).** Sin uso; lo reemplaza el nuevo nb 04 (`nb04-etapas.md`).
+
+Notebook: `notebooks/04_feature_engineering_y_seleccion_de_modelo_superseded.ipynb`.
 Reglas de trabajo: ver `CLAUDE.md` (R1–R8). Decisiones de la Etapa 0: spec.md, Session 2026-11-02,
 y constitución 6.0.0 (objetivo = ratio de unidades entre bloques).
 
