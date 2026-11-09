@@ -398,24 +398,116 @@ def save_interim(arrays: dict, tables: dict) -> None:
         df.to_parquet(INTERIM_DIR / f"{name}.parquet", index=False)
 
 
-def save_tables(out_dir, tables: dict, manifest: dict | None = None) -> list[Path]:
+def _same_content(a, b, ignore: tuple = ("saved_at",)) -> bool:
+    """Compara dos objetos guardables (dict, tablas, arreglos, listas, escalares) por contenido.
+
+    Las claves de `ignore` (p. ej. la fecha de guardado) no cuentan. Las tablas se comparan por
+    valores, sin exigir el mismo tipo de columna (Parquet puede devolver otro dtype).
+    """
+    if isinstance(a, dict) and isinstance(b, dict):
+        keys = set(a) - set(ignore)
+        return keys == set(b) - set(ignore) and all(_same_content(a[k], b[k], ignore) for k in keys)
+    if isinstance(a, (pd.DataFrame, pd.Series)) and type(a) is type(b):
+        try:
+            check = pd.testing.assert_frame_equal if isinstance(a, pd.DataFrame) else pd.testing.assert_series_equal
+            check(a.reset_index(drop=True), b.reset_index(drop=True), check_dtype=False, check_categorical=False)
+            return True
+        except AssertionError:
+            return False
+    if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
+        a, b = np.asarray(a), np.asarray(b)
+        if a.shape != b.shape:
+            return False
+        if a.dtype.kind in "fc" or b.dtype.kind in "fc":
+            return bool(np.allclose(a, b, equal_nan=True))
+        return bool(np.array_equal(a, b))
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same_content(x, y, ignore) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return (np.isnan(a) and np.isnan(b)) or bool(np.isclose(a, b))
+    return type(a) is type(b) and a == b
+
+
+def guard_rerun(paths, rerun: bool) -> list[Path]:
+    """Candado de un notebook cuyas salidas ya están guardadas.
+
+    Parámetros:
+        paths: salidas del notebook (archivos o carpetas).
+        rerun (bool): True para permitir la ejecución aunque existan.
+
+    Retorno:
+        list[Path]: salidas que ya existen.
+
+    Raises:
+        RuntimeError: si alguna salida existe y `rerun` es False.
+    """
+    existing = [Path(p) for p in paths if Path(p).exists()]
+    if existing and not rerun:
+        raise RuntimeError("Salidas ya guardadas: " + ", ".join(map(str, existing))
+                           + ". Para volver a ejecutar, pon RERUN = True (y OVERWRITE = True solo para reemplazarlas).")
+    return existing
+
+
+def save_pickle(obj, path, overwrite: bool = False) -> Path:
+    """`pd.to_pickle` que no reemplaza un archivo distinto sin permiso.
+
+    Si el archivo existe y su contenido es igual (sin contar `saved_at`), no se escribe. Si es
+    distinto, se detiene salvo `overwrite=True`.
+
+    Parámetros:
+        obj: objeto a guardar.
+        path: ruta del archivo.
+        overwrite (bool): reemplazar aunque el contenido guardado sea distinto.
+
+    Retorno:
+        Path: ruta del archivo.
+
+    Raises:
+        FileExistsError: si el archivo existe, su contenido es distinto y `overwrite` es False.
+    """
+    path = Path(path)
+    if path.exists() and not overwrite:
+        if _same_content(pd.read_pickle(path), obj):
+            return path
+        raise FileExistsError(f"{path} ya existe con otro contenido; para reemplazarlo usa overwrite=True.")
+    pd.to_pickle(obj, path)
+    return path
+
+
+def save_tables(out_dir, tables: dict, manifest: dict | None = None, overwrite: bool = False) -> list[Path]:
     """Guarda varias tablas en Parquet en `out_dir`, con un `manifest.json` que las describe.
 
     Parquet conserva Int64 con nulos y str. Las columnas category (con sus categorías y si son
     ordenadas) se anotan en el manifiesto y `load_tables` las restaura: Parquet devuelve como
     int64 una category de enteros.
 
+    Si ya hay un manifiesto en `out_dir`: con el mismo contenido (tablas y manifiesto, sin contar
+    `saved_at`) no se escribe nada; con otro, se detiene salvo `overwrite=True`.
+
     Parámetros:
         out_dir: carpeta de destino (se crea si no existe).
         tables (dict): nombre → pd.DataFrame.
         manifest (dict | None): datos extra para el manifiesto (listas de variables, parámetros).
+        overwrite (bool): reemplazar aunque lo guardado sea distinto.
 
     Retorno:
-        list[Path]: rutas escritas (las tablas y el manifiesto).
+        list[Path]: rutas de las tablas y del manifiesto.
+
+    Raises:
+        FileExistsError: si lo guardado es distinto y `overwrite` es False.
     """
     import json
 
     out_dir = Path(out_dir)
+    paths = [out_dir / f"{name}.parquet" for name in tables] + [out_dir / "manifest.json"]
+    if (out_dir / "manifest.json").exists() and not overwrite:
+        old_tables, old_manifest = load_tables(out_dir)
+        extra = json.loads(json.dumps(manifest or {}))
+        same = (set(old_tables) == set(tables) and all(_same_content(old_tables[n], tables[n]) for n in tables)
+                and all(_same_content(old_manifest.get(k), v) for k, v in extra.items()))
+        if same:
+            return paths
+        raise FileExistsError(f"{out_dir} ya tiene tablas con otro contenido; para reemplazarlas usa overwrite=True.")
     out_dir.mkdir(parents=True, exist_ok=True)
     paths = []
     for name, df in tables.items():

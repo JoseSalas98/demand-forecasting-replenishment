@@ -237,3 +237,43 @@ def test_save_and_load_tables_keep_dtypes(tmp_path):
     (tmp_path / "other" / "data.parquet").rename(tmp_path / "out" / "data.parquet")
     with pytest.raises(ValueError, match="manifiesto"):
         load_tables(tmp_path / "out")
+
+
+def test_save_tables_does_not_replace_different_content(tmp_path):
+    from src.data import load_tables, save_tables
+    df = pd.DataFrame({"item_id": pd.Categorical(["A", "B"]), "ratio": [1.0, 0.5]})
+    out = tmp_path / "out"
+    save_tables(out, {"data": df}, {"seed": 42})
+    saved_at = load_tables(out)[1]["saved_at"]
+    save_tables(out, {"data": df.copy()}, {"seed": 42})                 # mismo contenido: no escribe
+    assert load_tables(out)[1]["saved_at"] == saved_at
+    with pytest.raises(FileExistsError):
+        save_tables(out, {"data": df.assign(ratio=[1.0, 0.6])}, {"seed": 42})   # otra tabla
+    with pytest.raises(FileExistsError):
+        save_tables(out, {"data": df}, {"seed": 7})                     # otro manifiesto
+    pd.testing.assert_frame_equal(load_tables(out)[0]["data"], df)      # lo guardado no cambió
+    save_tables(out, {"data": df.assign(ratio=[1.0, 0.6])}, {"seed": 42}, overwrite=True)
+    assert load_tables(out)[0]["data"]["ratio"].tolist() == [1.0, 0.6]
+
+
+def test_save_pickle_same_content_different_content_and_overwrite(tmp_path):
+    from src.data import save_pickle
+    path = tmp_path / "b.pkl"
+    obj = {"meta": {"wrmsse": 0.5, "saved_at": "t1", "params": {"depth": 4}}, "backtest": pd.DataFrame({"pred": [1.0, 2.0]})}
+    save_pickle(obj, path)
+    save_pickle({**obj, "meta": {**obj["meta"], "saved_at": "t2"}}, path)   # solo cambia la fecha: no escribe
+    assert pd.read_pickle(path)["meta"]["saved_at"] == "t1"
+    other = {**obj, "backtest": pd.DataFrame({"pred": [1.0, 3.0]})}
+    with pytest.raises(FileExistsError):
+        save_pickle(other, path)
+    save_pickle(other, path, overwrite=True)
+    assert pd.read_pickle(path)["backtest"]["pred"].tolist() == [1.0, 3.0]
+
+
+def test_guard_rerun(tmp_path):
+    from src.data import guard_rerun
+    (tmp_path / "out.pkl").write_text("x")
+    assert guard_rerun([tmp_path / "missing.pkl"], rerun=False) == []
+    with pytest.raises(RuntimeError, match="RERUN"):
+        guard_rerun([tmp_path / "out.pkl", tmp_path / "missing.pkl"], rerun=False)
+    assert guard_rerun([tmp_path / "out.pkl"], rerun=True) == [tmp_path / "out.pkl"]
