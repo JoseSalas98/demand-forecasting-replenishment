@@ -5,6 +5,7 @@ Los NaN (días enmascarados) se ignoran.
 """
 
 import numpy as np
+import pandas as pd
 
 
 def naive_scale(train_units: np.ndarray) -> float:
@@ -138,3 +139,46 @@ def rmse(y: np.ndarray, y_hat: np.ndarray) -> float:
     """
     y, y_hat = _valid(y, y_hat)
     return float(np.sqrt(np.mean((y - y_hat) ** 2))) if len(y) else float("nan")
+
+
+def spend_weights(item_spend: np.ndarray, item_ids, window) -> pd.Series:
+    """Peso de cada artículo en el WRMSSE: su gasto en la ventana de pesos (días inclusive).
+
+    Parámetros:
+        item_spend (np.ndarray): gasto artículo × día (columna j = día j + 1), p. ej. de
+            `load_interim`.
+        item_ids: identificador de cada fila de `item_spend`.
+        window: (primer día, último día) para todos los artículos, o dict artículo → (primer
+            día, último día); con dict solo se devuelven esos artículos.
+
+    Retorno:
+        pd.Series: gasto por artículo (índice `item_id`); los NaN (días enmascarados) no suman.
+    """
+    ids = np.asarray(item_ids).astype(str)
+    row = {item: k for k, item in enumerate(ids)}
+    windows = window if isinstance(window, dict) else {item: window for item in ids}
+    spend = {item: float(np.nansum(np.asarray(item_spend[row[item], a - 1 : b], dtype=float)))
+             for item, (a, b) in windows.items()}
+    return pd.Series(spend, name="weight").rename_axis("item_id")
+
+
+def wrmsse_frame(df: pd.DataFrame, pred_col: str, scales: pd.Series, weights: pd.Series,
+                 actual_col: str = "units") -> tuple[float, list[str]]:
+    """`wrmsse` sobre una tabla larga (una fila por artículo y bloque).
+
+    El RMSSE de cada artículo junta todos sus bloques de la tabla (con los 13 folds de la
+    ventana, su error promedio en los 13 folds) y el agregado los pondera con `weights`.
+
+    Parámetros:
+        df (pd.DataFrame): con `item_id`, `actual_col` y `pred_col`.
+        scales (pd.Series): escala del RMSSE por artículo.
+        weights (pd.Series): peso por artículo.
+
+    Retorno:
+        tuple[float, list[str]]: WRMSSE y artículos excluidos (escala o peso no positivos).
+    """
+    y, y_hat = {}, {}
+    for item, g in df.groupby(df["item_id"].astype(str)):
+        y[item] = g[actual_col].to_numpy(float)
+        y_hat[item] = g[pred_col].to_numpy(float)
+    return wrmsse(y, y_hat, scales.to_dict(), weights.to_dict())
