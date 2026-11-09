@@ -207,6 +207,135 @@ def fill_store_breaks(units: pd.DataFrame, breaks: pd.DataFrame, rate_days: int)
     return as_frame(filled), as_frame(added)
 
 
+def long_break_runs(breaks: pd.DataFrame, window_start: pd.Series, min_days: int,
+                    chain_stores: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Rachas de quiebre largas por tienda: generalizadas (caída de la cadena) o aisladas.
+
+    Decisión del usuario (nb 03b, 5.3): una racha de quiebre de más de `min_days` días no se
+    completa con la tasa congelada (inventaría meses de venta).
+    - **Caída generalizada:** al menos `chain_stores` tiendas del artículo dentro de una racha
+      larga a la vez, durante `min_days` días o más. La historia del artículo empieza en el primer
+      bloque completo tras la vuelta a stock (fin del último episodio, `cut_d`); si no hay un
+      bloque completo después, `no_return`. Es un filtro de alcance (historia suficiente), no una
+      regla de pronóstico, por eso mira la serie completa.
+    - **Racha aislada:** la que no cae en su mayoría (> 50 % de sus días) dentro de un episodio
+      generalizado. La tienda se excluye desde `excl_start_d`: toda la racha si termina antes de la
+      ventana (se sabe en la historia); si no, sin mirar el futuro, desde el bloque en cuyo cierre
+      la racha ya superó `min_days` (los días anteriores se completan como siempre).
+
+    Parámetros:
+        breaks (pd.DataFrame): salida de `flag_store_breaks`.
+        window_start (pd.Series): `item_id` → primer día de la ventana de backtesting.
+        min_days (int): largo desde el cual una racha es larga (se cuenta `> min_days`).
+        chain_stores (int): tiendas a la vez para una caída generalizada.
+
+    Retorno:
+        tuple[pd.DataFrame, pd.DataFrame]:
+        - rachas largas: `item_id`, `store_id`, `start_d`, `end_d` (último día), `days`,
+          `generalized_share`, `kind` (`generalizada` / `aislada`) y `excl_start_d` (NaN si es
+          generalizada);
+        - cortes por artículo con caída generalizada: `item_id`, `episode_start_d`,
+          `episode_end_d`, `cut_d` (NaN si `no_return`) y `no_return`.
+    """
+    days = _days(breaks)
+    n = len(days)
+    pos = np.arange(n)
+    block_end = (pos // BLOCK_DAYS + 1) * BLOCK_DAYS - 1
+    B = breaks.to_numpy() > 0
+    items = breaks.index.get_level_values("item_id").to_numpy()
+    stores = breaks.index.get_level_values("store_id").to_numpy()
+    ws = window_start.reindex(items).to_numpy(dtype=float) - days[0]
+    if np.isnan(ws).any():
+        raise ValueError("hay artículos sin inicio de ventana.")
+
+    def spans(mask, longer_than=None, at_least=None):
+        edges = np.diff(np.r_[0, mask.astype(np.int8), 0])
+        out = zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1))
+        return [(s, e) for s, e in out if (longer_than is None or e - s > longer_than) and (at_least is None or e - s >= at_least)]
+
+    runs, in_long = [], np.zeros(B.shape, dtype=bool)
+    for r in np.flatnonzero(B.any(axis=1)):
+        for s, e in spans(B[r], longer_than=min_days):
+            in_long[r, s:e] = True
+            runs.append((r, s, e))
+    in_gen = np.zeros(B.shape, dtype=bool)
+    cuts = []
+    for item, rows in pd.Series(np.arange(len(items))).groupby(items):
+        rows = rows.to_numpy()
+        episodes = spans(in_long[rows].sum(axis=0) >= chain_stores, at_least=min_days)
+        if not episodes:
+            continue
+        for s, e in episodes:
+            in_gen[rows, s:e] = True
+        first_full = -(-episodes[-1][1] // BLOCK_DAYS) * BLOCK_DAYS  # primer bloque completo tras la vuelta
+        no_return = first_full >= n
+        cuts.append({"item_id": item, "episode_start_d": days[episodes[-1][0]], "episode_end_d": days[episodes[-1][1] - 1],
+                     "cut_d": np.nan if no_return else days[first_full], "no_return": no_return})
+    rows_out = []
+    for r, s, e in runs:
+        share = in_gen[r, s:e].mean()
+        kind = "generalizada" if share > 0.5 else "aislada"
+        if kind == "generalizada":
+            excl = np.nan
+        elif e <= ws[r]:
+            excl = days[s]
+        else:
+            seen = np.minimum(e - 1, block_end[s:e]) - s + 1
+            excl = days[s + int(np.argmax(seen > min_days))]
+        rows_out.append({"item_id": items[r], "store_id": stores[r], "start_d": days[s], "end_d": days[e - 1],
+                         "days": e - s, "generalized_share": share, "kind": kind, "excl_start_d": excl})
+    runs_cols = ["item_id", "store_id", "start_d", "end_d", "days", "generalized_share", "kind", "excl_start_d"]
+    cut_cols = ["item_id", "episode_start_d", "episode_end_d", "cut_d", "no_return"]
+    return pd.DataFrame(rows_out, columns=runs_cols), pd.DataFrame(cuts, columns=cut_cols)
+
+
+def exclude_long_runs(units: pd.DataFrame, breaks: pd.DataFrame, runs: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Saca a la tienda de sus rachas aisladas largas, desde `excl_start_d` hasta el fin de la racha.
+
+    Esos días quedan en NaN (como un día sin precio) y sin marca de quiebre: no se completan y no
+    entran a la tasa de la tienda ni a su umbral. En la suma del artículo la tienda aporta lo que
+    vendió, es decir 0.
+
+    Parámetros:
+        units (pd.DataFrame): salida de `store_units`.
+        breaks (pd.DataFrame): salida de `flag_store_breaks` (mismo índice y columnas).
+        runs (pd.DataFrame): primera salida de `long_break_runs`.
+
+    Retorno:
+        tuple[pd.DataFrame, pd.DataFrame]: unidades y quiebres con los días excluidos.
+    """
+    if not (breaks.index.equals(units.index) and breaks.columns.equals(units.columns)):
+        raise ValueError("breaks debe tener el mismo índice y columnas que units.")
+    iso = runs[runs["kind"] == "aislada"]
+    X, C = units.to_numpy(copy=True), breaks.to_numpy(copy=True)
+    d0 = _days(units)[0]
+    rows = units.index.get_indexer(pd.MultiIndex.from_frame(iso[["item_id", "store_id"]]))
+    if (rows < 0).any():
+        raise ValueError("hay rachas de series que no están en units.")
+    for r, a, b in zip(rows, iso["excl_start_d"].to_numpy(dtype=int) - d0, iso["end_d"].to_numpy(dtype=int) - d0 + 1):
+        X[r, a:b] = np.nan
+        C[r, a:b] = 0
+    return (pd.DataFrame(X, index=units.index, columns=units.columns),
+            pd.DataFrame(C, index=breaks.index, columns=breaks.columns))
+
+
+def cut_item_bounds(bounds: pd.DataFrame, cuts: pd.DataFrame) -> pd.DataFrame:
+    """Mueve el inicio del artículo al primer bloque completo tras una caída generalizada.
+
+    Parámetros:
+        bounds (pd.DataFrame): `first_sale_d` y `last_sale_d` por `item_id`.
+        cuts (pd.DataFrame): segunda salida de `long_break_runs`.
+
+    Retorno:
+        pd.DataFrame: copia de `bounds` con `first_sale_d` = máx(`first_sale_d`, `cut_d`); los
+        artículos sin vuelta a stock (`no_return`) se quitan.
+    """
+    out = bounds.copy()
+    ok = cuts[~cuts["no_return"]].set_index("item_id")["cut_d"]
+    out.loc[ok.index, "first_sale_d"] = np.maximum(out.loc[ok.index, "first_sale_d"], ok)
+    return out.drop(index=cuts.loc[cuts["no_return"], "item_id"])
+
+
 def store_block_summary(units: pd.DataFrame, breaks: pd.DataFrame, added: pd.DataFrame) -> pd.DataFrame:
     """Resumen por tienda × artículo × bloque de 28 días (para revisar la validez del bloque de tienda).
 
