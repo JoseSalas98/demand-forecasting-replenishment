@@ -430,9 +430,15 @@ mismo conjunto y los mismos 13 orígenes.
   1, y por producto objetivo si mantiene su clase y su celda.
   La réplica NO DEBE modificar la lista, el tratamiento ni los candidatos, y ninguna etapa de
   selección de modelos DEBE leerla.
-- **FR-031**: El informe final DEBE presentar los resultados como backtesting sobre datos
-  históricos, con la advertencia de sesgo de selección: valen para el subconjunto evaluado, no
-  para todo el catálogo.
+- **FR-031**: El informe final (presentación en `reports/`, constitución 7.1.0) DEBE presentar los
+  resultados como backtesting sobre datos históricos, con la advertencia de sesgo de selección:
+  valen para el subconjunto evaluado, no para todo el catálogo.
+- **FR-036** (constitución 7.1.0): El sistema DEBE estimar en el test el impacto del pronóstico en
+  el negocio contra la demanda tratada: disponible = pronóstico + z·σ (σ = RMSE del artículo en la
+  ventana de backtesting); venta capturada, venta perdida y exceso a precio de venta, para el
+  CatBoost (a un paso y encadenado), el seasonal naive y el pronóstico perfecto; la curva exceso
+  frente a venta perdida al variar z; y el impacto global, por segmento y por artículo. Es
+  descriptivo y no cambia el modelo.
 
 ### Key Entities
 
@@ -475,13 +481,17 @@ mismo conjunto y los mismos 13 orígenes.
   backtesting y a la primera evaluación en test. Ninguna decisión usa datos del año 5.
   Excepción registrada (2026-11-02): los candidatos se declararon después de la réplica (nb 03,
   Etapa 13) y antes de cualquier backtesting; la réplica no alimentó ninguna selección.
-- **SC-006**: El conjunto de modelos elegidos por artículo tiene un WRMSSE menor que el del
-  seasonal naive sobre los mismos productos objetivo y los mismos 13 orígenes.
+- **SC-006** (constitución 7.0.0): El CatBoost global tiene un WRMSSE menor que el del seasonal
+  naive sobre los mismos productos objetivo y los mismos 13 orígenes, en el backtesting y en el
+  test.
 - **SC-007**: Cada modelo se evalúa en test exactamente una vez.
 - **SC-008**: Con el informe final, un analista identifica para cada producto objetivo su clase,
   su aporte al gasto estimado, su tratamiento y su pronóstico, sin consultar otra fuente.
 - **SC-009**: El informe incluye la advertencia de backtesting y sesgo de selección, WAPE y RMSE
   como diagnóstico, y la réplica en el año 5 del 100 % de los productos objetivo.
+- **SC-010** (constitución 7.1.0): El impacto en el negocio se reporta en dinero (venta capturada,
+  venta perdida y exceso) del CatBoost frente al seasonal naive, con la curva de intercambio, el
+  impacto por segmento y el ranking de artículos de mayor y menor impacto.
 
 ## Entregables
 
