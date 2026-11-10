@@ -1,5 +1,22 @@
 <!--
 Sync Impact Report
+- Version change: 7.0.0 → 7.1.0 (MINOR, 2026-11-10)
+- Motivo (usuario): el informe final como notebook repetía lo que ya está en los nb 03 a 05; el
+  nb 06 pasa a medir el impacto del pronóstico en el negocio (venta capturada, venta perdida y
+  exceso, en dinero). Se registra además la medición encadenada del nb 05 (uso en producción).
+  Resultado del test (nb 05, ya medido): WRMSSE en unidades a un paso 0,495 frente a 0,868 del
+  seasonal naive (cumple la aceptación); encadenado 13 bloques 0,748, sin umbral.
+- Modified principles:
+  - VII. Métricas y aceptación: nuevas reglas "Encadenado (producción)" e "Impacto en el negocio".
+- Modified sections: Flujo de trabajo (… → evaluación única en test (nb 05) → impacto en el
+  negocio (nb 06) → informe final en `reports/`).
+- Removed sections: ninguna.
+- Impacto sobre artefactos congelados: ninguno. El nb 06 solo lee lo guardado por el nb 05 y los
+  intermedios; no cambia datos, variables, hiperparámetros ni el modelo.
+- Artefactos por actualizar: spec.md (FR-031, SC-006, nuevos FR-036 y SC-010), CLAUDE.md, nb 06
+  y su registro de etapas.
+
+Historial 7.0.0
 - Version change: 6.2.0 → 7.0.0 (MAJOR, 2026-11-09)
 - Motivo del MAJOR (usuario): se redefinen reglas del Principio VI (NO NEGOCIABLE) y del VII: el
   candidato pasa a ser un único CatBoost global, sin selección por artículo, y el tratamiento de
@@ -485,6 +502,16 @@ evaluación.
 - **Aceptación agregada:** el CatBoost global DEBE tener un WRMSSE menor que el del seasonal naive,
   en el backtesting (0,506 frente a 0,894) y en el test.
 - **MAE:** diagnóstico, sin umbral.
+- **Encadenado (producción):** en el test se mide también el pronóstico encadenado de 13 bloques
+  desde el último bloque de train con el modelo del nb 04 (cada bloque parte del pronóstico del
+  anterior), frente al mismo seasonal naive. Es una medida del uso en producción, sin umbral de
+  aceptación.
+- **Impacto en el negocio (nb 06):** se mide en el test, contra la demanda tratada (la serie del
+  nb 03b, no la venta cruda: en un quiebre la venta cruda subestima la demanda y castiga al
+  pronóstico que acierta). Disponible = pronóstico + z·σ, con σ = RMSE del artículo en la ventana
+  de backtesting (nunca del test). Métricas, a precio de venta: venta capturada, venta perdida y
+  exceso, frente al seasonal naive y al pronóstico perfecto, y la curva exceso frente a venta
+  perdida al variar z. Es descriptivo: no tiene umbral ni alimenta ninguna decisión del modelo.
 
 **Razón:** WRMSSE es la métrica de referencia de M5 y es robusta a series intermitentes, donde
 MAPE no está definido o se distorsiona. Con 13 bloques por artículo, elegir entre varios modelos
@@ -508,12 +535,17 @@ nuevos.
   → matriz ABC × XYZ sobre train → estabilidad y lista objetivo (congeladas) → declaración de
   candidatos de pronóstico → réplica en el año 5 → tratamiento por tienda y datasets (nb 03b) →
   búsqueda de hiperparámetros con backtesting en train (nb 03c) → diagnóstico de la selección
-  (nb 03d) → reentrenamiento (nb 04) → evaluación única en test (nb 05) → informe final.
+  (nb 03d) → reentrenamiento (nb 04) → evaluación única en test (nb 05) → impacto en el
+  negocio (nb 06) → informe final (presentación en `reports/`, desde lo guardado).
 - El nb 04 carga los datasets del nb 03b y los hiperparámetros del nb 03c y reentrena el CatBoost
   global con todo el train (años 1–4, incluida la ventana de backtesting), sin ninguna búsqueda.
   La evaluación en test (13 orígenes) es del nb 05. El nb 04 anterior (tratamiento por artículo,
   579 artículos) queda como `04_feature_engineering_y_seleccion_de_modelo_superseded.ipynb`, sin
   uso.
+- El nb 05 mide el test una sola vez (a un paso y encadenado) y guarda pronósticos y métricas en
+  `data/interim/nb05_test/`. El nb 06 carga esa medición y estima el impacto en el negocio; no
+  vuelve a pronosticar ni a medir el error. El informe final ya no es un notebook: se arma en
+  `reports/` con lo guardado.
 - El RMV se cierra cuando el ranking ABC × XYZ y el pronóstico de clase A cumplen los criterios
   de aceptación de la especificación.
 - Todo plan (`/speckit-plan`) DEBE pasar una verificación de cumplimiento contra los Principios
@@ -532,4 +564,4 @@ nuevos.
   la centralización de parámetros, el registro de rechazos, el aislamiento del test y la
   justificación escrita de cada abstracción.
 
-**Version**: 7.0.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-11-09
+**Version**: 7.1.0 | **Ratified**: 2026-10-24 | **Last Amended**: 2026-11-10
