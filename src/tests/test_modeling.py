@@ -358,3 +358,177 @@ def test_selected_forecast_takes_winner_column():
     np.testing.assert_array_equal(selected_forecast(window, pd.Series({"A": "m1", "B": "snaive"})), [1, 2, 6, 6])
     with pytest.raises(ValueError):
         selected_forecast(window, pd.Series({"A": "m1", "B": "m1"}))   # B no tiene m1
+
+
+class _LagModel:
+    """Modelo de prueba: la tasa pronosticada es 1 + 0,1 × ratio_lag1."""
+    def predict(self, X):
+        return 1 + 0.1 * X["ratio_lag1"].to_numpy()
+
+
+def _ratio_data():
+    rows = []
+    for item, base in [("A", 1.0), ("B", 2.0)]:
+        for b in range(1, 7):
+            fold = 0 if b <= 3 else b - 3
+            rows.append({"item_id": item, "block": b, "fold": fold, "ratio": base + b / 10,
+                         "ratio_treated": False, "n_x": b})
+    return pd.DataFrame(rows)
+
+
+def test_recursive_ratio_forecast_chains_predictions():
+    from src.modeling import recursive_ratio_forecast
+    data = _ratio_data()
+    out = recursive_ratio_forecast(data, _LagModel(), ["ratio_lag1", "n_x"], lags=[1], windows=[], stats=[],
+                                   first_fold=1, horizon=3).set_index(["item_id", "step"])["ratio_hat"]
+    # Paso 1 usa la tasa real del origen (bloque 3); los pasos 2 y 3, la tasa pronosticada del paso anterior.
+    a1 = 1 + 0.1 * 1.3
+    a2 = 1 + 0.1 * a1
+    assert np.isclose(out[("A", 1)], a1) and np.isclose(out[("A", 2)], a2) and np.isclose(out[("A", 3)], 1 + 0.1 * a2)
+    assert np.isclose(out[("B", 1)], 1 + 0.1 * 2.3)
+    # Nunca usa las tasas reales posteriores al origen.
+    changed = data.assign(ratio=np.where(data["fold"] >= 1, 99.0, data["ratio"]))
+    out2 = recursive_ratio_forecast(changed, _LagModel(), ["ratio_lag1", "n_x"], lags=[1], windows=[], stats=[],
+                                    first_fold=1, horizon=3).set_index(["item_id", "step"])["ratio_hat"]
+    pd.testing.assert_series_equal(out, out2)
+
+
+def test_chain_units_compounds_from_origin():
+    from src.modeling import chain_units
+    path = pd.DataFrame({"item_id": ["A", "B", "A", "A", "B"], "step": [2, 1, 1, 3, 2],
+                         "ratio_hat": [0.5, 2.0, 1.1, 2.0, 1.0]})
+    out = chain_units(path, pd.Series({"A": 100.0, "B": 10.0}))
+    # A: 100 × 1,1 = 110 → 110 × 0,5 = 55 → 55 × 2 = 110; B: 10 × 2 = 20 → 20 × 1 = 20 (orden de `path`).
+    np.testing.assert_allclose(out, [55, 20, 110, 110, 20])
+    with pytest.raises(ValueError):
+        chain_units(path, pd.Series({"A": 100.0}))
+
+
+def test_plot_forecast_item_rates_and_units():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from src.modeling import plot_forecast_item
+    data = pd.DataFrame({"item_id": "A", "block": range(1, 6), "start_date": pd.date_range("2012-01-01", periods=5, freq="28D"),
+                         "split": ["train"] * 4 + ["test"], "units": [10.0, 12, 12, 6, 99], "ratio_raw": [1.0, 1.2, 1.0, 0.5, 9.0],
+                         "imputed": [False, True, False, False, False], "cell": "AX"})
+    table = pd.DataFrame({"item_id": "A", "block": [3, 4], "step": [1, 2], "ratio_1step": [1.0, 0.5], "ratio_chain": [1.0, 1.0],
+                          "units_1step": [12.0, 6.0], "units_chain": [12.0, 12.0]})
+    fig = plot_forecast_item(data, table, "A", rate_scale=1.0, unit_scale=1.0)
+    ax_rate, ax_rate_err, ax_units, ax_units_err = fig.axes
+    assert 9.0 not in ax_rate.lines[0].get_ydata() and 99.0 not in ax_units.lines[0].get_ydata()   # sin test
+    labels = [t.get_text() for t in ax_units.get_legend().get_texts()]
+    assert any("a un paso (WAPE 0.0%" in s for s in labels) and any("encadenado (WAPE 33.3%" in s for s in labels)   # |12−6| / 18
+    assert len(ax_rate_err.patches) == len(ax_units_err.patches) == 4
+    plt.close(fig)
+
+
+
+def _small_catboost():
+    from catboost import CatBoostRegressor
+    rng = np.random.default_rng(0)
+    X = pd.DataFrame({"x": rng.normal(size=60), "z": rng.normal(size=60), "g": pd.Categorical(rng.choice(["a", "b"], 60))})
+    y = 2 * X["x"] + (X["g"] == "a") + 0.1 * rng.normal(size=60)
+    model = CatBoostRegressor(iterations=30, depth=3, cat_features=["g"], random_seed=0, verbose=0, allow_writing_files=False)
+    return model.fit(X, y), X
+
+
+def test_catboost_shap_adds_up_to_prediction():
+    from src.modeling import catboost_shap
+    model, X = _small_catboost()
+    shap, base = catboost_shap(model, X)
+    assert list(shap.columns) == list(X.columns) and shap.index.equals(X.index)
+    np.testing.assert_allclose(base + shap.sum(axis=1), model.predict(X), atol=1e-9)
+
+
+def test_shap_importance_total_and_groups():
+    from src.modeling import shap_importance
+    shap = pd.DataFrame({"x": [1.0, -3.0, 2.0], "z": [0.5, 0.5, -0.5]}, index=[10, 11, 12])
+    out = shap_importance(shap, pd.Series(["AX", "AY", "AY"], index=[10, 11, 12]))
+    assert list(out.index) == ["x", "z"] and list(out.columns) == ["total", "AX", "AY"]
+    np.testing.assert_allclose(out.loc["x"], [2.0, 1.0, 2.5])
+    np.testing.assert_allclose(out.loc["z"], [0.5, 0.5, 0.5])
+    with pytest.raises(ValueError):
+        shap_importance(shap, pd.Series(["AX"] * 3))
+
+
+def test_plot_shap_importance_panels():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from src.modeling import plot_shap_importance
+    imp = pd.DataFrame({"total": [2.0, 0.5], "AX": [1.0, 1.0], "AY": [3.0, 1.0]}, index=["x", "z"])
+    fig = plot_shap_importance(imp)
+    ax_bar, ax_map = fig.axes[:2]
+    assert len(ax_bar.patches) == 2
+    texts = sorted(t.get_text() for t in ax_map.texts)
+    assert texts == ["25.0", "50.0", "50.0", "75.0"]   # AX: 50/50; AY: 75/25
+    plt.close(fig)
+
+
+def test_save_catboost_model_roundtrip_and_lock(tmp_path):
+    from catboost import CatBoostRegressor
+    from src.modeling import load_catboost_model, save_catboost_model
+    model, X = _small_catboost()
+    out = tmp_path / "m"
+    save_catboost_model(model, {"seed": 0, "features": list(X.columns)}, out)
+    loaded, meta = load_catboost_model(out)
+    np.testing.assert_array_equal(loaded.predict(X), model.predict(X))
+    assert meta["features"] == ["x", "z", "g"] and "saved_at" in meta
+    stamp = meta["saved_at"]
+    save_catboost_model(model, {"seed": 0, "features": list(X.columns)}, out)   # igual: no escribe
+    with pytest.raises(FileExistsError):
+        save_catboost_model(model, {"seed": 1, "features": list(X.columns)}, out)   # otro meta
+    other = CatBoostRegressor(iterations=5, depth=2, cat_features=["g"], random_seed=1, verbose=0,
+                              allow_writing_files=False).fit(X, X["x"])
+    with pytest.raises(FileExistsError):
+        save_catboost_model(other, {"seed": 0, "features": list(X.columns)}, out)   # otro modelo
+    save_catboost_model(other, {"seed": 1}, out, overwrite=True)
+    loaded, meta = load_catboost_model(out)
+    assert loaded == other and meta == {"saved_at": meta["saved_at"], "seed": 1}
+    assert stamp  # la primera escritura dejó fecha
+
+
+def test_assign_test_folds_numbers_test_by_position():
+    from src.modeling import assign_test_folds, fold_masks
+    data = pd.DataFrame({"item_id": ["B"] * 4 + ["A"] * 5, "block": [3, 4, 5, 6, 1, 2, 3, 4, 5],
+                         "split": ["train", "train", "test", "test", "train", "train", "train", "test", "test"],
+                         "fold": pd.array([0, 1, None, None, 0, 1, 2, None, None], dtype="Int64")})
+    out = assign_test_folds(data)
+    assert out["fold"].tolist() == [0, 0, 0, 1, 2, 0, 0, 1, 2]   # A: 1–3 train, 4–5 test; B: 3–4 train, 5–6 test
+    train, valid = fold_masks(out, 2)
+    assert out.loc[valid, "block"].tolist() == [5, 6] and train.sum() == 7   # todo el train + el test 1
+    with pytest.raises(ValueError):
+        assign_test_folds(data[~((data["item_id"] == "A") & (data["block"] == 4))])   # hueco antes del test
+
+
+def test_plot_forecast_item_draws_test_when_asked():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from src.modeling import plot_forecast_item
+    data = pd.DataFrame({"item_id": "A", "block": range(1, 6), "start_date": pd.date_range("2012-01-01", periods=5, freq="28D"),
+                         "split": ["train"] * 3 + ["test"] * 2, "units": [10.0, 12, 12, 6, 99], "ratio_raw": [1.0, 1.2, 1.0, 0.5, 16.5],
+                         "imputed": False, "cell": "AX"})
+    table = pd.DataFrame({"item_id": "A", "block": [4, 5], "step": [1, 2], "ratio_1step": [0.5, 16.5], "ratio_chain": [0.5, 1.0],
+                          "units_1step": [6.0, 99.0], "units_chain": [6.0, 6.0]})
+    fig = plot_forecast_item(data, table, "A", 1.0, 1.0, splits=("train", "test"), window_label="test")
+    ax_rate, _, ax_units, _ = fig.axes
+    assert 99.0 in ax_units.lines[0].get_ydata() and 16.5 in ax_rate.lines[0].get_ydata()   # el test se dibuja
+    assert ax_rate.get_title(loc="left").startswith("A · AX · test:")
+    plt.close(fig)
+
+
+def test_plot_tradeoff_curves_panels():
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from src.modeling import plot_tradeoff_curves
+    curves = pd.DataFrame({"segment": "total", "forecast": ["m"] * 3 + ["seasonal naive"] * 3, "z": [-1.0, 0, 1] * 2,
+                           "lost": [30.0, 10, 2, 40, 20, 8], "excess": [1.0, 5, 20, 3, 12, 40]})
+    marks = pd.DataFrame({"segment": ["total"], "forecast": ["m"], "lost": [5.0], "excess": [10.0]})
+    fig = plot_tradeoff_curves(curves, ["m", "seasonal naive"], ["total"], marks, "x")
+    ax = fig.axes[0]
+    assert len(ax.lines) == 2 and list(ax.lines[0].get_xdata()) == [1.0, 5, 20]
+    assert np.isclose(ax.get_ylim()[1], 1.15 * 20)   # recorte: mayor perdida entre z = 0 (20) y la estrella (5)
+    plt.close(fig)

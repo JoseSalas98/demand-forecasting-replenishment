@@ -31,6 +31,32 @@ def assign_folds(data: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def assign_test_folds(data: pd.DataFrame) -> pd.DataFrame:
+    """Numera los orígenes del test como folds, para medir el test con el régimen del backtesting.
+
+    Constitución, Principio VI: en test se repite el backtesting. Todo el train (ventana incluida)
+    pasa a fold 0 y el k-ésimo bloque de test de cada artículo a fold k, por posición (la partición
+    es por artículo). Así `fold_masks`, `boosting_backtest` y `recursive_ratio_forecast` sirven
+    igual que en la ventana.
+
+    Parámetros:
+        data (pd.DataFrame): dataset con `item_id`, `block` y `split` (train / test).
+
+    Retorno:
+        pd.DataFrame: copia ordenada por artículo y bloque con `fold` (Int64) reemplazado.
+    """
+    out = data.sort_values(["item_id", "block"]).reset_index(drop=True)
+    is_test = out["split"] == "test"
+    last_train = out[~is_test].groupby("item_id", observed=True)["block"].max()
+    first_test = out[is_test].groupby("item_id", observed=True)["block"].min()
+    if not (first_test == last_train.reindex(first_test.index) + 1).all():
+        raise ValueError("el test de cada artículo debe empezar justo después de su train")
+    fold = pd.Series(0, index=out.index, dtype="Int64")
+    fold[is_test] = out[is_test].groupby("item_id", observed=True).cumcount() + 1
+    out["fold"] = fold
+    return out
+
+
 def fold_masks(data: pd.DataFrame, k: int) -> tuple[pd.Series, pd.Series]:
     """Filas de entrenamiento y de validación del fold k.
 
@@ -775,3 +801,363 @@ def selected_forecast(window: pd.DataFrame, winner: pd.Series) -> np.ndarray:
     if np.isnan(out).any():
         raise ValueError("el modelo elegido no tiene pronóstico en alguna fila")
     return out
+
+
+def recursive_ratio_forecast(data: pd.DataFrame, model, features: list[str], lags: list[int], windows: list[int],
+                             stats: list[str], first_fold: int = 1, horizon: int = 13) -> pd.DataFrame:
+    """Pronóstico encadenado de la tasa (ratio) de `horizon` bloques desde un mismo origen.
+
+    El origen es el último bloque antes del fold `first_fold` de cada artículo. Para el paso h
+    los rezagos y ventanas del ratio (`ratio_lag*`, `ratio_roll*`) se recalculan con la historia
+    real hasta el origen más las tasas pronosticadas en los pasos 1 a h − 1, con las mismas
+    funciones del dataset (`add_lags`, `add_rolling`). Las demás variables (calendario, edad,
+    `item_id`, `cell`) se conocen de antemano y se toman del dataset. En cada paso se pronostican
+    todos los artículos a la vez.
+
+    Parámetros:
+        data (pd.DataFrame): dataset del boosting con `fold`, `ratio` y `ratio_treated`.
+        model: modelo ya entrenado (solo con lo anterior al origen).
+        features (list[str]): variables del modelo, en su orden.
+        lags (list[int]): rezagos del ratio (`target_lags`).
+        windows (list[int]): ventanas móviles (`rolling_windows`).
+        stats (list[str]): estadísticos móviles (`rolling_stats`).
+        first_fold (int): primer bloque pronosticado (1 = inicio de la ventana).
+        horizon (int): bloques hacia adelante.
+
+    Retorno:
+        pd.DataFrame: una fila por artículo y paso con `item_id`, `block`, `fold`, `step` y
+        `ratio_hat` (tasa pronosticada).
+    """
+    from src.features import add_lags, add_rolling
+
+    ratio_cols = [c for c in features if c.startswith("ratio_lag") or c.startswith("ratio_roll")]
+    fold = data["fold"]
+    hist = data.loc[fold.notna() & (fold < first_fold), ["item_id", "block", "ratio", "ratio_treated"]]
+    future = data[fold.between(first_fold, first_fold + horizon - 1)].sort_values(["item_id", "block"])
+    future = future.assign(step=(future["fold"] - first_fold + 1).astype(int))
+    if not (future.groupby("item_id", observed=True)["step"].count() == horizon).all():
+        raise ValueError(f"cada artículo necesita {horizon} bloques después del origen")
+    path = future[["item_id", "block", "ratio_treated"]].assign(ratio=np.nan, ratio_treated=False)
+    out = []
+    for h in range(1, horizon + 1):
+        frame = pd.concat([hist, path], ignore_index=True)
+        frame = add_lags(frame, ["ratio"], lags)
+        frame = add_rolling(frame, "ratio", windows, stats, treated_col="ratio_treated")
+        rows = future[future["step"] == h]
+        X = rows.reindex(columns=features).copy()   # las columnas del ratio se recalculan abajo
+        recalc = rows[["item_id", "block"]].merge(frame[["item_id", "block"] + ratio_cols], on=["item_id", "block"],
+                                                  how="left", validate="one_to_one")
+        X[ratio_cols] = recalc[ratio_cols].to_numpy()
+        ratio_hat = model.predict(X)
+        step = rows[["item_id", "block", "fold", "step"]].assign(ratio_hat=ratio_hat)
+        out.append(step)
+        # La tasa pronosticada pasa a ser historia del paso siguiente.
+        key = path[["item_id", "block"]].merge(step[["item_id", "block", "ratio_hat"]], on=["item_id", "block"], how="left")
+        path["ratio"] = path["ratio"].where(key["ratio_hat"].isna().to_numpy(), key["ratio_hat"].to_numpy())
+    res = pd.concat(out, ignore_index=True)
+    res["item_id"] = res["item_id"].astype(str)
+    res["fold"] = res["fold"].astype(int)
+    return res
+
+
+def chain_units(path: pd.DataFrame, origin_units: pd.Series, ratio_col: str = "ratio_hat") -> np.ndarray:
+    """Unidades encadenadas desde el origen: Û(t+h) = U(t) × r̂(t+1) × … × r̂(t+h).
+
+    Cada bloque toma como base las unidades pronosticadas del bloque anterior (en el paso 1, las
+    unidades reales del origen), igual que en producción.
+
+    Parámetros:
+        path (pd.DataFrame): una fila por artículo y paso con `item_id`, `step` y `ratio_col`.
+        origin_units (pd.Series): artículo → unidades reales del bloque de origen.
+        ratio_col (str): columna con la tasa pronosticada.
+
+    Retorno:
+        np.ndarray: unidades pronosticadas de cada fila de `path`, en su mismo orden.
+
+    Raises:
+        ValueError: si falta el origen de algún artículo o un artículo tiene pasos repetidos.
+    """
+    if path.duplicated(["item_id", "step"]).any():
+        raise ValueError("pasos repetidos por artículo")
+    order = path.sort_values(["item_id", "step"])
+    base = order["item_id"].astype(str).map(origin_units)
+    if base.isna().any():
+        raise ValueError("falta el origen de algún artículo")
+    growth = order[ratio_col].groupby(order["item_id"].astype(str), sort=False).cumprod()
+    return (base * growth).reindex(path.index).to_numpy(float)
+
+
+def plot_forecast_item(data: pd.DataFrame, table: pd.DataFrame, item_id: str, rate_scale: float,
+                       unit_scale: float, splits: tuple = ("train",), window_label: str = "ventana de backtesting"):
+    """Gráfico de un artículo: pronóstico a un paso y encadenado, en tasas y en unidades, con su error.
+
+    Fila de arriba, tasas: tasa real (`ratio_raw`) de todo el train, la ventana sombreada, la tasa a
+    un paso (`ratio_1step`) y la encadenada (`ratio_chain`). Fila de abajo, unidades: unidades reales
+    (círculo hueco = bloque completado por el tratamiento), las de un paso (`units_1step`) y las
+    encadenadas (`units_chain`). En cada leyenda, el WAPE y el RMSSE de cada pronóstico en la
+    ventana. A la derecha, el error de cada bloque de la ventana (pronóstico − real): en tasa, y en
+    unidades como % de lo real. Solo se dibujan las particiones de `splits` (por omisión, sin test).
+
+    Parámetros:
+        data (pd.DataFrame): con `item_id`, `block`, `start_date`, `split`, `units`, `ratio_raw`,
+            `imputed` y `cell`.
+        table (pd.DataFrame): una fila por artículo y bloque de la ventana con `item_id`, `block`,
+            `step` y las columnas `ratio_1step`, `ratio_chain`, `units_1step` y `units_chain`.
+        item_id (str): artículo.
+        rate_scale (float): escala del RMSSE en tasas.
+        unit_scale (float): escala del RMSSE en unidades.
+        splits (tuple): particiones que se dibujan; ("train", "test") para pronósticos del test.
+        window_label (str): nombre de la ventana pronosticada, para el título.
+
+    Retorno:
+        matplotlib.figure.Figure: la figura.
+    """
+    import matplotlib.pyplot as plt
+
+    from src.metrics import rmsse, wape
+
+    rows = data[(data["item_id"].astype(str) == item_id) & data["split"].isin(splits)].sort_values("block")
+    win = table[table["item_id"].astype(str) == item_id].drop(columns=["start_date", "units", "ratio_raw"], errors="ignore")
+    win = win.merge(rows[["block", "start_date", "units", "ratio_raw"]], on="block").sort_values("block")
+    fig, axes = plt.subplots(2, 2, figsize=(14, 6.4), gridspec_kw={"width_ratios": [3, 1]})
+    styles = {"1step": dict(color="tab:orange", ls="--", label="a un paso"), "chain": dict(color="tab:blue", ls="-", label="encadenado")}
+    levels = [("ratio", "ratio_raw", rate_scale, "tasa (unidades / bloque anterior)", "error de la tasa"),
+              ("units", "units", unit_scale, "unidades por bloque", "error en unidades (% de lo real)")]
+    for (prefix, real_col, scale, ylabel, err_title), (ax, ax_err) in zip(levels, axes):
+        ax.plot(rows["start_date"], rows[real_col], color="0.35", lw=1.2, label="real")
+        if prefix == "units":
+            imputed = rows["imputed"].astype(bool).to_numpy()
+            ax.scatter(rows["start_date"][imputed], rows[real_col][imputed], facecolors="none", edgecolors="0.35",
+                       s=22, zorder=3, label="completado")
+        else:
+            ax.axhline(1, color="0.6", lw=0.8, ls=":")
+        ax.axvspan(win["start_date"].min(), win["start_date"].max(), color="0.5", alpha=0.08, lw=0)
+        width = 0.38
+        for k, (kind, st) in enumerate(styles.items()):
+            pred = win[f"{prefix}_{kind}"]
+            w, r = wape(win[real_col], pred), rmsse(win[real_col], pred, scale)
+            ax.plot(win["start_date"], pred, color=st["color"], ls=st["ls"], lw=1.5, marker="o", ms=3,
+                    label=f"{st['label']} (WAPE {w:.1%}, RMSSE {r:.2f})")
+            err = pred - win[real_col]
+            if prefix == "units":
+                err = 100 * err / win[real_col]
+            ax_err.bar(win["step"] + (k - 0.5) * width, err, width=width, color=st["color"], label=st["label"])
+        ax.set_ylabel(ylabel)
+        ax.legend(fontsize=8, loc="upper left", frameon=False)
+        ax_err.axhline(0, color="0.3", lw=0.8)
+        ax_err.set_title(err_title, fontsize=9, loc="left")
+        ax_err.set_xticks(win["step"])
+        ax_err.tick_params(axis="x", labelsize=7)
+    axes[0, 0].set_title(f"{item_id} · {rows['cell'].iloc[0]} · {window_label}: a un paso vs encadenado desde su inicio",
+                         fontsize=10, loc="left")
+    axes[0, 1].legend(fontsize=7, frameon=False)
+    axes[1, 1].set_xlabel("paso (bloque de la ventana)", fontsize=8)
+    return fig
+
+
+
+# --- Modelo final: importancia de las variables con SHAP ------------------------------------------
+
+def catboost_shap(model, X: pd.DataFrame) -> tuple[pd.DataFrame, float]:
+    """Valores SHAP de un CatBoost ya entrenado, con su cálculo nativo (sin la librería `shap`).
+
+    Parámetros:
+        model: `CatBoostRegressor` entrenado.
+        X (pd.DataFrame): filas a explicar, con las mismas columnas del ajuste.
+
+    Retorno:
+        tuple: (`pd.DataFrame` con un valor SHAP por fila y variable, mismo índice y columnas que `X`;
+        valor esperado del modelo). Por fila, valor esperado + suma de los SHAP = predicción.
+    """
+    from catboost import Pool
+
+    pool = Pool(X, cat_features=model.get_cat_feature_indices())
+    raw = model.get_feature_importance(pool, type="ShapValues")   # última columna: valor esperado
+    return pd.DataFrame(raw[:, :-1], index=X.index, columns=X.columns), float(raw[0, -1])
+
+
+def shap_importance(shap: pd.DataFrame, groups: pd.Series) -> pd.DataFrame:
+    """Importancia de cada variable: media de |SHAP| en todas las filas y en cada grupo.
+
+    Parámetros:
+        shap (pd.DataFrame): valores SHAP por fila y variable (`catboost_shap`).
+        groups (pd.Series): grupo de cada fila (p. ej., el segmento), mismo índice que `shap`.
+
+    Retorno:
+        pd.DataFrame: una fila por variable, ordenada de mayor a menor importancia total, con
+        `total` y una columna por grupo (en el orden de los grupos).
+    """
+    if not groups.index.equals(shap.index):
+        raise ValueError("groups debe tener el mismo índice que shap")
+    absolute = shap.abs()
+    out = absolute.groupby(groups.astype(str).to_numpy()).mean().T
+    out.insert(0, "total", absolute.mean())
+    return out.sort_values("total", ascending=False).rename_axis("variable")
+
+
+def plot_shap_importance(importance: pd.DataFrame, title: str = ""):
+    """Importancia SHAP: barras con la total y mapa de calor por grupo.
+
+    Izquierda, media de |SHAP| de cada variable en todas las filas. Derecha, para cada grupo (columna),
+    la parte de su importancia que aporta cada variable (% de la suma de su columna), para comparar
+    qué variables pesan más en cada grupo aunque la escala de los SHAP difiera entre grupos; en la
+    cabecera, la suma de |SHAP| medio del grupo.
+
+    Parámetros:
+        importance (pd.DataFrame): salida de `shap_importance`.
+        title (str): título de la figura.
+
+    Retorno:
+        matplotlib.figure.Figure: la figura.
+    """
+    import matplotlib.pyplot as plt
+
+    groups = [c for c in importance.columns if c != "total"]
+    share = 100 * importance[groups] / importance[groups].sum()
+    n = len(importance)
+    fig, (ax_bar, ax_map) = plt.subplots(1, 2, figsize=(13, 0.28 * n + 1.6), sharey=True,
+                                         gridspec_kw={"width_ratios": [2, 1.2]})
+    y = np.arange(n)
+    ax_bar.barh(y, importance["total"], color="tab:blue")
+    ax_bar.set_yticks(y, importance.index, fontsize=8)
+    ax_bar.invert_yaxis()
+    ax_bar.set_xlabel("media de |SHAP| (tasa)")
+    ax_bar.set_title("importancia total", fontsize=10, loc="left")
+    image = ax_map.imshow(share.to_numpy(), aspect="auto", cmap="Blues")
+    for i in range(n):
+        for j in range(len(groups)):
+            v = share.iat[i, j]
+            ax_map.text(j, i, f"{v:.1f}", ha="center", va="center", fontsize=7,
+                        color="white" if v > share.to_numpy().max() * 0.6 else "black")
+    ax_map.set_xticks(range(len(groups)), [f"{g}\nΣ {importance[g].sum():.3f}" for g in groups], fontsize=8)
+    ax_map.xaxis.tick_top()
+    ax_map.set_title("% de la importancia de cada segmento", fontsize=10, loc="left", pad=28)
+    fig.colorbar(image, ax=ax_map, fraction=0.05, pad=0.02, label="%")
+    if title:
+        fig.suptitle(title, fontsize=11, x=0.01, ha="left")
+    fig.tight_layout()
+    return fig
+
+
+# --- Modelo final: guardado y carga ---------------------------------------------------------------
+
+MODEL_FILE = "catboost_global.cbm"
+META_FILE = "meta.json"
+
+
+def save_catboost_model(model, meta: dict, out_dir, overwrite: bool = False) -> list:
+    """Guarda un CatBoost en formato nativo (`.cbm`) con su `meta.json`, sin reemplazar otro distinto.
+
+    Si ya hay un modelo en `out_dir`: igual (mismo modelo según CatBoost y mismo `meta`, sin contar
+    `saved_at`) no se escribe nada; distinto, se detiene salvo `overwrite=True`. Los bytes del
+    `.cbm` no sirven para comparar: dos guardados del mismo modelo difieren.
+
+    Parámetros:
+        model: `CatBoostRegressor` entrenado.
+        meta (dict): datos del modelo, serializables en JSON; se agrega `saved_at`.
+        out_dir: carpeta de destino (se crea si no existe).
+        overwrite (bool): reemplazar aunque lo guardado sea distinto.
+
+    Retorno:
+        list[Path]: rutas del modelo y del `meta.json`.
+
+    Raises:
+        FileExistsError: si lo guardado es distinto y `overwrite` es False.
+    """
+    import json
+    from pathlib import Path
+
+    from src.data import _same_content
+
+    out_dir = Path(out_dir)
+    paths = [out_dir / MODEL_FILE, out_dir / META_FILE]
+    meta = json.loads(json.dumps(meta))   # falla aquí, antes de escribir, si algo no es JSON
+    if paths[0].exists() and not overwrite:
+        old_model, old_meta = load_catboost_model(out_dir)
+        if old_model == model and _same_content(old_meta, meta):
+            return paths
+        raise FileExistsError(f"{out_dir} ya tiene otro modelo; para reemplazarlo usa overwrite=True.")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model.save_model(str(paths[0]))
+    meta = {"saved_at": pd.Timestamp.now().isoformat(timespec="seconds"), **meta}
+    paths[1].write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    return paths
+
+
+def load_catboost_model(out_dir):
+    """Lee el modelo y el `meta.json` que escribió `save_catboost_model`.
+
+    Retorno:
+        tuple: (`CatBoostRegressor`, dict con el meta).
+    """
+    import json
+    from pathlib import Path
+
+    from catboost import CatBoostRegressor
+
+    out_dir = Path(out_dir)
+    model = CatBoostRegressor()
+    model.load_model(str(out_dir / MODEL_FILE))
+    return model, json.loads((out_dir / META_FILE).read_text(encoding="utf-8"))
+
+
+# --- Impacto en el negocio: curvas de intercambio -------------------------------------------------
+
+FORECAST_STYLES = {"a un paso": dict(color="tab:orange", ls="--"), "encadenado": dict(color="tab:blue", ls="-"),
+                   "seasonal naive": dict(color="0.45", ls=":")}
+
+
+def plot_tradeoff_curves(curves: pd.DataFrame, forecasts: list, segments: list, marks: pd.DataFrame | None = None,
+                         title: str = ""):
+    """Curvas de intercambio: exceso (eje X) frente a venta perdida (eje Y), un panel por segmento.
+
+    Cada pronóstico es una curva (un punto por z); más abajo y a la izquierda es mejor. El
+    pronóstico perfecto es el origen (no pierde ni sobra). Se marca z = 0 con un círculo y, si se
+    pasan, los puntos de `marks` (p. ej. el 95 % de servicio) con una estrella. El eje vertical se
+    recorta a 1,15 veces la mayor venta perdida entre z = 0 y las estrellas: los z negativos llevan
+    la venta perdida a toda la demanda y aplastarían la zona que interesa. Montos en millones.
+
+    Parámetros:
+        curves (pd.DataFrame): `segment`, `forecast`, `z`, `lost` y `excess`.
+        forecasts (list): pronósticos que se dibujan, en orden (estilos en `FORECAST_STYLES`).
+        segments (list): un panel por segmento.
+        marks (pd.DataFrame | None): `segment`, `forecast`, `lost` y `excess` de los puntos a marcar.
+        title (str): título de la figura.
+
+    Retorno:
+        matplotlib.figure.Figure: la figura.
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+    millions = FuncFormatter(lambda v, _: f"{v / 1e6:,.1f}")
+    fig, axes = plt.subplots(1, len(segments), figsize=(4.4 * len(segments), 4.2))
+    axes = np.atleast_1d(axes)
+    for ax, seg in zip(axes, segments):
+        top = 0.0
+        for name in forecasts:
+            c = curves[(curves["segment"] == seg) & (curves["forecast"] == name)].sort_values("z")
+            st = FORECAST_STYLES.get(name, {})
+            ax.plot(c["excess"], c["lost"], lw=1.8, label=name, **st)
+            z0 = c[np.isclose(c["z"], 0)]
+            ax.scatter(z0["excess"], z0["lost"], s=30, facecolors="white", edgecolors=st.get("color", "k"), zorder=3)
+            top = max(top, float(z0["lost"].max()))
+            if marks is not None:
+                m = marks[(marks["segment"] == seg) & (marks["forecast"] == name)]
+                ax.scatter(m["excess"], m["lost"], marker="*", s=120, color=st.get("color", "k"), zorder=4)
+                top = max(top, float(m["lost"].max()) if len(m) else 0.0)
+        ax.scatter([0], [0], color="black", s=24, zorder=4, label="perfecto")
+        ax.set_title(seg, fontsize=10, loc="left")
+        ax.set_xlabel("exceso, millones")
+        for axis in (ax.xaxis, ax.yaxis):
+            axis.set_major_formatter(millions)
+            axis.set_major_locator(MaxNLocator(4))
+        ax.set_xlim(left=0)
+        ax.set_ylim(0, 1.15 * top if top > 0 else None)
+        ax.text(0.97, 0.95, "↙ mejor", transform=ax.transAxes, ha="right", va="top", fontsize=8, color="0.4")
+        ax.grid(alpha=0.25)
+    axes[0].set_ylabel("venta perdida, millones")
+    axes[0].legend(fontsize=8, frameon=False, loc="upper center")
+    fig.suptitle(title + "  (○ sin colchón, z = 0 · ★ 95 % de servicio)", fontsize=11, x=0.01, ha="left")
+    fig.tight_layout()
+    return fig

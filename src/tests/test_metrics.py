@@ -123,3 +123,63 @@ def test_paired_bootstrap_wrmsse():
     assert out["p_a_not_better"] == 0.0
     with pytest.raises(ValueError):
         paired_bootstrap_wrmsse(b.iloc[1:], b, w, n_boot=10, seed=0)
+
+
+def test_tukey_outliers_by_group():
+    import pandas as pd
+    import pytest
+
+    from src.metrics import tukey_outliers
+    values = pd.Series([1.0, 2, 3, 4, 100, 10, 20, 30, 40, 50, np.nan])
+    groups = pd.Series(["a"] * 5 + ["b"] * 6)
+    out = tukey_outliers(values, groups)
+    # a: Q1 = 2, Q3 = 4, techo 7 → solo 100; b: Q1 = 20, Q3 = 40, techo 70 → nada; el nulo no se marca.
+    assert out.tolist() == [False] * 4 + [True] + [False] * 6
+    with pytest.raises(ValueError):
+        tukey_outliers(values, groups.iloc[:5])
+
+
+def test_block_totals_sums_each_block():
+    import pandas as pd
+
+    from src.metrics import block_totals
+    daily = np.array([[1.0, 2, np.nan, 4, 5, 6], [10, 20, 30, 40, 50, 60]])
+    day_of = pd.Series([1, 2, 3, 4, 5, 6], index=pd.date_range("2015-01-01", periods=6))
+    rows = pd.DataFrame({"item_id": ["B", "A", "A"], "start_date": pd.to_datetime(["2015-01-04", "2015-01-01", "2015-01-04"])})
+    out = block_totals(daily, ["A", "B"], rows, day_of, block_days=3)
+    np.testing.assert_allclose(out, [150, 3, 15])   # el NaN no suma
+
+
+def test_coverage_by_z_money_and_buffer():
+    import pandas as pd
+    import pytest
+
+    from src.metrics import coverage_by_z
+    df = pd.DataFrame({"item_id": ["A", "A", "B"], "units": [10.0, 10.0, 4.0], "price": [2.0, 2.0, 1.0],
+                       "f": [8.0, 13.0, 0.0]})
+    out = coverage_by_z(df, {"m": "f", "perfecto": "units"}, {"m": pd.Series({"A": 2.0, "B": 1.0})}, [0, 1, -10])
+    a0 = out[(out.forecast == "m") & (out.z == 0) & (out.item_id == "A")].iloc[0]
+    # Bloque 1: disponible 8 → captura 16, pierde 4; bloque 2: disponible 13 → captura 20, sobra 6.
+    assert (a0.demand, a0.captured, a0.lost, a0.excess, a0.short_blocks) == (40, 36, 4, 6, 1)
+    a1 = out[(out.forecast == "m") & (out.z == 1) & (out.item_id == "A")].iloc[0]   # disponible 10 y 15
+    assert (a1.captured, a1.lost, a1.excess) == (40, 0, 10)
+    b_neg = out[(out.forecast == "m") & (out.z == -10) & (out.item_id == "B")].iloc[0]   # nunca negativo
+    assert (b_neg.captured, b_neg.lost, b_neg.excess) == (0, 4, 0)
+    perfect = out[out.forecast == "perfecto"]
+    assert (perfect.lost == 0).all() and (perfect.excess == 0).all()
+    assert np.allclose(out.captured + out.lost, out.demand)
+    with pytest.raises(ValueError):
+        coverage_by_z(df, {"m": "f"}, {"m": pd.Series({"A": 1.0})}, [0])
+
+
+def test_service_reading_and_lost_at_excess():
+    import pandas as pd
+
+    from src.metrics import lost_at_excess, service_reading
+    curve = pd.DataFrame({"z": [0.0, 1, 2], "service": [0.8, 0.9, 1.0], "lost": [20.0, 10, 0], "excess": [5.0, 15, 35]})
+    r = service_reading(curve, 0.95)
+    assert np.isclose(r["z"], 1.5) and np.isclose(r["lost"], 5) and np.isclose(r["excess"], 25)
+    assert service_reading(curve, 0.5).isna().all()                 # fuera de la curva: no extrapola
+    assert np.isclose(lost_at_excess(curve, 10), 15) and np.isnan(lost_at_excess(curve, 50))
+    flat = curve.assign(service=[0.8, 1.0, 1.0])                     # tramo plano: primer z que llega
+    assert np.isclose(service_reading(flat, 1.0)["z"], 1)
