@@ -189,3 +189,5 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# Modelos: el binario se reproduce con el nb 04; se versiona solo su meta.json
+models/*.cbm
