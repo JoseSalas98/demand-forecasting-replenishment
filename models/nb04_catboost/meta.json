@@ -1,0 +1,85 @@
+{
+  "saved_at": "2026-11-09T18:55:45",
+  "algorithm": "catboost",
+  "target": "ratio",
+  "features": [
+    "ratio_lag1",
+    "ratio_lag2",
+    "ratio_lag3",
+    "ratio_lag13",
+    "ratio_roll3_mean",
+    "ratio_roll3_std",
+    "ratio_roll3_median",
+    "ratio_roll3_range",
+    "ratio_roll6_mean",
+    "ratio_roll6_std",
+    "ratio_roll6_median",
+    "ratio_roll6_range",
+    "ratio_roll13_mean",
+    "ratio_roll13_std",
+    "ratio_roll13_median",
+    "ratio_roll13_range",
+    "n_religious",
+    "n_national",
+    "n_cultural",
+    "n_sporting",
+    "n_religious_lag1",
+    "n_religious_lag2",
+    "n_national_lag1",
+    "n_national_lag2",
+    "n_cultural_lag1",
+    "n_cultural_lag2",
+    "n_sporting_lag1",
+    "n_sporting_lag2",
+    "year",
+    "period",
+    "age",
+    "item_id",
+    "cell"
+  ],
+  "cat_features": [
+    "item_id",
+    "cell",
+    "period"
+  ],
+  "params": {
+    "loss_function": "RMSE",
+    "border_count": 64,
+    "bootstrap_type": "Bernoulli",
+    "boosting_type": "Plain",
+    "cat_features": [
+      "item_id",
+      "cell",
+      "period"
+    ],
+    "depth": 4,
+    "n_estimators": 450,
+    "learning_rate": 0.07105754327165416,
+    "l2_leaf_reg": 2.909726254047063,
+    "random_strength": 0.1147831653251715,
+    "subsample": 0.7367534294846864,
+    "rsm": 0.5024003667598801
+  },
+  "seed": 42,
+  "n_threads": 6,
+  "fit": {
+    "rule": "split == train y ratio no nulo",
+    "rows": 24348,
+    "items": 517,
+    "first_block": 2,
+    "last_block": 52
+  },
+  "source": {
+    "nb03b_saved_at": "2026-11-07T08:25:38",
+    "nb03c_trial": 43,
+    "nb03c_saved_at": "2026-11-07T14:35:13",
+    "nb03c_wrmsse": 0.5061642207408358
+  },
+  "versions": {
+    "python": "3.12.3",
+    "numpy": "2.5.4",
+    "pandas": "3.1.0",
+    "pyarrow": "26.0.0",
+    "catboost": "1.2.10"
+  }
+}
