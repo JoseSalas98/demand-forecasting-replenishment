@@ -300,3 +300,133 @@ def paired_bootstrap_wrmsse(rmsse_a: pd.Series, rmsse_b: pd.Series, weights: pd.
     tail = (1 - level) / 2
     return {"diff": float(np.dot(w, d) / w.sum()), "low": float(np.quantile(boot, tail)),
             "high": float(np.quantile(boot, 1 - tail)), "p_a_not_better": float(np.mean(boot >= 0))}
+
+
+def tukey_outliers(values: pd.Series, groups: pd.Series, k: float = 1.5) -> pd.Series:
+    """Marca los valores atípicos por arriba dentro de cada grupo (regla de Tukey).
+
+    Atípico = mayor que Q3 + k·IQR de su grupo. Solo por arriba: interesa el error alto. Un valor
+    nulo nunca se marca y no entra en los cuartiles.
+
+    Parámetros:
+        values (pd.Series): valor por fila (p. ej., el RMSSE de cada artículo).
+        groups (pd.Series): grupo de cada fila (p. ej., el segmento), mismo índice que `values`.
+        k (float): múltiplo del rango intercuartílico (1,5 es el valor clásico de Tukey).
+
+    Retorno:
+        pd.Series: booleana, mismo índice que `values`.
+    """
+    if not groups.index.equals(values.index):
+        raise ValueError("groups debe tener el mismo índice que values")
+    by = groups.astype(str)
+    q1 = values.groupby(by).transform(lambda v: v.quantile(0.25))
+    q3 = values.groupby(by).transform(lambda v: v.quantile(0.75))
+    return (values > q3 + k * (q3 - q1)).fillna(False).astype(bool)
+
+
+def block_totals(daily: np.ndarray, item_ids, rows: pd.DataFrame, day_of: pd.Series, block_days: int) -> np.ndarray:
+    """Suma de un arreglo diario por artículo en el bloque de cada fila (días inclusive).
+
+    Sirve para llevar a bloques la venta y el gasto crudos de `load_interim`. Los días NaN
+    (enmascarados) no suman: cuentan como 0 venta observada.
+
+    Parámetros:
+        daily (np.ndarray): artículo × día (columna j = día j + 1).
+        item_ids: identificador de cada fila de `daily`.
+        rows (pd.DataFrame): una fila por artículo y bloque con `item_id` y `start_date`.
+        day_of (pd.Series): fecha → número de día d.
+        block_days (int): días por bloque.
+
+    Retorno:
+        np.ndarray: total de cada fila de `rows`, en su orden.
+    """
+    row_of = {item: k for k, item in enumerate(np.asarray(item_ids).astype(str))}
+    items = rows["item_id"].astype(str).to_numpy()
+    starts = day_of.reindex(pd.to_datetime(rows["start_date"])).to_numpy()
+    if np.isnan(starts.astype(float)).any():
+        raise ValueError("hay fechas de inicio que no están en el calendario")
+    out = np.empty(len(rows))
+    for k, (item, d) in enumerate(zip(items, starts.astype(int))):
+        out[k] = np.nansum(np.asarray(daily[row_of[item], d - 1 : d - 1 + block_days], dtype=float))
+    return out
+
+
+def coverage_by_z(df: pd.DataFrame, forecasts: dict, sigma: dict, z_values) -> pd.DataFrame:
+    """Venta capturada, venta perdida y exceso de cada pronóstico para cada colchón z, por artículo.
+
+    En cada bloque: disponible = max(pronóstico + z·σ, 0); capturada = min(disponible, demanda)·p;
+    perdida = max(demanda − disponible, 0)·p; exceso = max(disponible − demanda, 0)·p. Cada bloque
+    se evalúa por separado (sin arrastrar lo que sobra). Los montos se suman por artículo.
+
+    Parámetros:
+        df (pd.DataFrame): una fila por artículo y bloque con `item_id`, `units` (demanda),
+            `price` y las columnas de pronóstico en unidades.
+        forecasts (dict): nombre del pronóstico → columna de `df`.
+        sigma (dict): nombre del pronóstico → pd.Series de σ por artículo; si falta, σ = 0.
+        z_values: valores de z.
+
+    Retorno:
+        pd.DataFrame: una fila por artículo, pronóstico y z con `demand`, `captured`, `lost`,
+        `excess` (dinero) y `short_blocks` (bloques con disponible < demanda).
+    """
+    items = df["item_id"].astype(str)
+    demand = df["units"].to_numpy(float)
+    price = df["price"].to_numpy(float)
+    out = []
+    for name, col in forecasts.items():
+        s = sigma.get(name)
+        sd = np.zeros(len(df)) if s is None else items.map(s).to_numpy(float)
+        if np.isnan(sd).any():
+            raise ValueError(f"{name}: falta σ para algún artículo")
+        for z in z_values:
+            available = np.maximum(df[col].to_numpy(float) + z * sd, 0.0)
+            frame = pd.DataFrame({"item_id": items.to_numpy(), "demand": demand * price,
+                                  "captured": np.minimum(available, demand) * price,
+                                  "lost": np.maximum(demand - available, 0.0) * price,
+                                  "excess": np.maximum(available - demand, 0.0) * price,
+                                  "short_blocks": (available < demand).astype(int)})
+            out.append(frame.groupby("item_id", sort=True).sum().reset_index().assign(forecast=name, z=float(z)))
+    cols = ["item_id", "forecast", "z", "demand", "captured", "lost", "excess", "short_blocks"]
+    return pd.concat(out, ignore_index=True)[cols]
+
+
+def service_reading(curve: pd.DataFrame, target: float) -> pd.Series:
+    """Lee una curva de intercambio en un nivel de servicio: z, venta perdida y exceso interpolados.
+
+    Parámetros:
+        curve (pd.DataFrame): un pronóstico, una fila por z con `z`, `service` (0–1), `lost` y
+            `excess`; el servicio no baja al subir z.
+        target (float): nivel de servicio buscado (p. ej. 0,95).
+
+    Retorno:
+        pd.Series: `z`, `lost` y `excess` en ese servicio; NaN si el objetivo queda fuera de la
+        curva (no se extrapola).
+    """
+    c = curve.sort_values("z")
+    service = c["service"].to_numpy(float)
+    if (np.diff(service) < -1e-12).any():
+        raise ValueError("el servicio debe ser no decreciente en z")
+    if not service[0] <= target <= service[-1]:
+        return pd.Series({"z": np.nan, "lost": np.nan, "excess": np.nan})
+    # Con tramos planos, np.interp toma el primer z que alcanza el objetivo.
+    keep = np.r_[True, np.diff(service) > 0]
+    return pd.Series({col: float(np.interp(target, service[keep], c[col].to_numpy(float)[keep]))
+                      for col in ("z", "lost", "excess")})
+
+
+def lost_at_excess(curve: pd.DataFrame, excess: float) -> float:
+    """Venta perdida de una curva de intercambio para un nivel de exceso dado (interpolada).
+
+    Parámetros:
+        curve (pd.DataFrame): un pronóstico, una fila por z con `z`, `lost` y `excess`.
+        excess (float): exceso en dinero.
+
+    Retorno:
+        float: venta perdida con ese exceso; NaN si el exceso queda fuera de la curva.
+    """
+    c = curve.sort_values("z")
+    x = c["excess"].to_numpy(float)
+    if not x[0] <= excess <= x[-1]:
+        return float("nan")
+    keep = np.r_[True, np.diff(x) > 0]
+    return float(np.interp(excess, x[keep], c["lost"].to_numpy(float)[keep]))
