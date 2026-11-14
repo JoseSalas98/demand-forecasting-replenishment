@@ -910,6 +910,12 @@ ds = [
     { name = "tqdm" },
     { name = "xgboost-cpu" },
 ]
+front = [
+    { name = "numpy" },
+    { name = "pandas" },
+    { name = "pyarrow" },
+    { name = "pytest" },
+]
 
 [package.metadata]
 
@@ -934,6 +940,12 @@ ds = [
     { name = "statsmodels", specifier = ">=0.15.0" },
     { name = "tqdm", specifier = ">=4.70.1" },
     { name = "xgboost-cpu", specifier = ">=3.4.1" },
+]
+front = [
+    { name = "numpy", specifier = ">=2.5.4" },
+    { name = "pandas", specifier = ">=3.1.0" },
+    { name = "pyarrow", specifier = ">=26.0.0" },
+    { name = "pytest", specifier = ">=9.1.1" },
 ]
 
 [[package]]
