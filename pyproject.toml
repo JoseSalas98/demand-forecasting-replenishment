@@ -17,31 +17,52 @@ classifiers = [
 ]
 requires-python = "~=3.12.0"
 
+[tool.flit.module]
+name = "src"
 
 [tool.ruff]
 line-length = 99
-src = ["main"]
-include = ["pyproject.toml", "main/**/*.py"]
+src = ["src"]
+include = ["pyproject.toml", "src/**/*.py"]
 extend-exclude = [".pixi"]
 
 [tool.ruff.lint]
 extend-select = ["I"]  # Add import sorting
 
 [tool.ruff.lint.isort]
-known-first-party = ["main"]
+known-first-party = ["src"]
 force-sort-within-sections = true
+
+[tool.pytest.ini_options]
+testpaths = ["src/tests"]
+pythonpath = ["."]
 
 [dependency-groups]
 dev = [
+    "ipywidgets>=8.1.9",
     "notebook>=7.6.3",
+    "pytest>=9.1.1",
 ]
 ds = [
+    "catboost>=1.2.10",
+    "lightgbm>=4.7.0",
     "matplotlib>=3.11.2",
     "numpy>=2.5.4",
+    "optuna>=5.0.0",
     "pandas>=3.1.0",
     "plotly>=7.1.0",
+    "pyarrow>=26.0.0",
     "scikit-learn>=1.9.1",
     "scipy>=1.18.1",
     "seaborn>=0.13.2",
+    "statsmodels>=0.15.0",
+    "tqdm>=4.70.1",
+    "xgboost-cpu>=3.4.1",
+]
+front = [
+    "numpy>=2.5.4",
+    "pandas>=3.1.0",
+    "pyarrow>=26.0.0",
+    "pytest>=9.1.1",
 ]
 

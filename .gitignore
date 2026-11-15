@@ -189,3 +189,11 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# Modelos: el binario se reproduce con el nb 04; se versiona solo su meta.json
+models/**/*.cbm
+
+# Figuras generadas por los notebooks: se regeneran al correrlos
+reports/figures/**/*.png
+
+# Figuras del informe final: se regeneran con reports/pronostico_reposicion/hacer_figuras.py
+reports/pronostico_reposicion/figuras/*.png
